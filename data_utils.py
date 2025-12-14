@@ -117,8 +117,51 @@ def normalize_csv_data(df: pd.DataFrame) -> pd.DataFrame:
     return normalized_df[['time', 'open', 'high', 'low', 'close']].copy()
 
 
+def apply_spread_slippage(
+    price: float,
+    direction: str,
+    spread_pips: float,
+    slippage_pips: float,
+    instrument_params: Dict,
+    is_entry: bool
+) -> float:
+    """
+    Apply spread and slippage to a price.
+    
+    Args:
+        price: Base price (open or close)
+        direction: 'Long' or 'Short'
+        spread_pips: Spread in pips
+        slippage_pips: Additional slippage in pips
+        instrument_params: Instrument parameters dictionary
+        is_entry: True for entry, False for exit
+    
+    Returns:
+        Adjusted price with spread and slippage
+    """
+    pip_size = instrument_params['pip_size']
+    spread_price = spread_pips * pip_size
+    slippage_price = slippage_pips * pip_size
+    
+    if direction == "Long":
+        if is_entry:
+            # Long entry: buy at ask (higher price)
+            return price + (spread_price / 2) + slippage_price
+        else:
+            # Long exit: sell at bid (lower price)
+            return price - (spread_price / 2) - slippage_price
+    else:  # Short
+        if is_entry:
+            # Short entry: sell at bid (lower price)
+            return price - (spread_price / 2) - slippage_price
+        else:
+            # Short exit: buy at ask (higher price)
+            return price + (spread_price / 2) + slippage_price
+
+
 def calculate_profit(
-    price_diff: float,
+    entry_price: float,
+    exit_price: float,
     direction: str,
     position_size: float,
     instrument_params: Dict,
@@ -128,7 +171,8 @@ def calculate_profit(
     Calculate profit in quote currency.
     
     Args:
-        price_diff: Price difference (close - open for long, open - close for short)
+        entry_price: Entry price (already adjusted for spread/slippage)
+        exit_price: Exit price (already adjusted for spread/slippage)
         direction: 'Long' or 'Short'
         position_size: Position size in lots
         instrument_params: Instrument parameters dictionary
@@ -137,12 +181,16 @@ def calculate_profit(
     Returns:
         Profit in quote currency (dollars for USD pairs)
     """
-    contract_size = instrument_params['contract_size']
     pip_size = instrument_params['pip_size']
     pip_value_per_lot = instrument_params['pip_value_per_lot']
     
+    # Calculate price difference
+    if direction == "Long":
+        price_diff = exit_price - entry_price
+    else:  # Short
+        price_diff = entry_price - exit_price
+    
     # Calculate profit: (price_diff / pip_size) * pip_value_per_lot * position_size
-    # This works for both forex and crypto
     profit = (price_diff / pip_size) * pip_value_per_lot * position_size
     
     # Subtract commission (round-turn = 2 sides)
@@ -156,7 +204,10 @@ def generate_trades_dt(
     start_hour: time,
     end_hour: time,
     selected_days: list,
-    direction: str
+    direction: str,
+    spread_pips: float = 0.0,
+    slippage_pips: float = 0.0,
+    instrument_params: Optional[Dict] = None
 ) -> pd.DataFrame:
     """
     Generate day trading trades (one per day).
@@ -248,18 +299,32 @@ def generate_trades_dt(
                 else:
                     continue
         
+        # Apply spread and slippage to entry and exit prices
+        if instrument_params is not None:
+            entry_price = apply_spread_slippage(
+                entry_bar['open'], direction, spread_pips, slippage_pips,
+                instrument_params, is_entry=True
+            )
+            exit_price = apply_spread_slippage(
+                exit_bar['close'], direction, spread_pips, slippage_pips,
+                instrument_params, is_entry=False
+            )
+        else:
+            entry_price = entry_bar['open']
+            exit_price = exit_bar['close']
+        
         # Calculate price difference
         if direction == "Long":
-            price_diff = exit_bar['close'] - entry_bar['open']
+            price_diff = exit_price - entry_price
         else:
-            price_diff = entry_bar['open'] - exit_bar['close']
+            price_diff = entry_price - exit_price
         
         trades.append({
             'date': date,
             'entry_time': entry_bar['time'],
             'exit_time': exit_bar['time'],
-            'open_price': entry_bar['open'],
-            'close_price': exit_bar['close'],
+            'open_price': entry_price,
+            'close_price': exit_price,
             'price_diff': price_diff
         })
     
@@ -271,7 +336,10 @@ def generate_trades_dt(
 
 def generate_trades_swing(
     df: pd.DataFrame,
-    direction: str
+    direction: str,
+    spread_pips: float = 0.0,
+    slippage_pips: float = 0.0,
+    instrument_params: Optional[Dict] = None
 ) -> pd.DataFrame:
     """
     Generate swing trading trades (one per day, open to close).
@@ -279,6 +347,9 @@ def generate_trades_swing(
     Args:
         df: Filtered DataFrame
         direction: 'Long' or 'Short'
+        spread_pips: Spread in pips
+        slippage_pips: Additional slippage in pips
+        instrument_params: Instrument parameters dictionary
     
     Returns:
         DataFrame with trades
@@ -294,17 +365,32 @@ def generate_trades_swing(
         first_bar = day_data.iloc[0]
         last_bar = day_data.iloc[-1]
         
-        if direction == "Long":
-            price_diff = last_bar['close'] - first_bar['open']
+        # Apply spread and slippage to entry and exit prices
+        if instrument_params is not None:
+            entry_price = apply_spread_slippage(
+                first_bar['open'], direction, spread_pips, slippage_pips,
+                instrument_params, is_entry=True
+            )
+            exit_price = apply_spread_slippage(
+                last_bar['close'], direction, spread_pips, slippage_pips,
+                instrument_params, is_entry=False
+            )
         else:
-            price_diff = first_bar['open'] - last_bar['close']
+            entry_price = first_bar['open']
+            exit_price = last_bar['close']
+        
+        # Calculate price difference
+        if direction == "Long":
+            price_diff = exit_price - entry_price
+        else:
+            price_diff = entry_price - exit_price
         
         trades.append({
             'date': date,
             'entry_time': first_bar['time'],
             'exit_time': last_bar['time'],
-            'open_price': first_bar['open'],
-            'close_price': last_bar['close'],
+            'open_price': entry_price,
+            'close_price': exit_price,
             'price_diff': price_diff
         })
     

@@ -330,6 +330,24 @@ elif st.session_state['current_tab'] == 'Market Mapper':
                     key="days_multiselect_swing"
                 )
                 st.session_state['selected_days'] = selected_days
+            
+            # Execution Costs (optional, collapsible)
+            with st.expander("Execution Costs (Spread/Slippage)"):
+                col_spread_label, col_spread_input = st.columns([1, 2])
+                with col_spread_label:
+                    st.write("Spread (pips):")
+                with col_spread_input:
+                    spread_pips = st.number_input("", min_value=0.0, max_value=1000.0, value=st.session_state.get('spread_pips', 0.0), step=0.1, label_visibility="collapsed", key="spread_pips", help="Bid-ask spread in pips. Applied to both entry and exit")
+                
+                col_slippage_label, col_slippage_input = st.columns([1, 2])
+                with col_slippage_label:
+                    st.write("Slippage (pips):")
+                with col_slippage_input:
+                    slippage_pips = st.number_input("", min_value=0.0, max_value=1000.0, value=st.session_state.get('slippage_pips', 0.0), step=0.1, label_visibility="collapsed", key="slippage_pips", help="Additional slippage in pips beyond spread. Applied to both entry and exit")
+            
+            # Ensure values are available even when expander is collapsed
+            spread_pips = st.session_state.get('spread_pips', 0.0)
+            slippage_pips = st.session_state.get('slippage_pips', 0.0)
         
         with col_right:
             # Apply filters to data
@@ -345,20 +363,27 @@ elif st.session_state['current_tab'] == 'Market Mapper':
             symbol_name = st.session_state.get('data_symbol', 'DEFAULT')
             instrument_params = get_instrument_params(symbol_name)
             
-            # Generate trades based on mode
+            # Generate trades based on mode (with spread/slippage applied)
             if mode == "DT":
-                trades_df = generate_trades_dt(filtered_df, start_hour, end_hour, selected_days, direction)
+                trades_df = generate_trades_dt(
+                    filtered_df, start_hour, end_hour, selected_days, direction,
+                    spread_pips, slippage_pips, instrument_params
+                )
             else:
-                trades_df = generate_trades_swing(filtered_df, direction)
+                trades_df = generate_trades_swing(
+                    filtered_df, direction,
+                    spread_pips, slippage_pips, instrument_params
+                )
             
             if len(trades_df) == 0:
                 st.warning("No trades found matching the selected filters")
                 filtered_df = pd.DataFrame()
             else:
-                # Calculate profit for each trade
+                # Calculate profit for each trade (prices already include spread/slippage)
                 trades_df['profit'] = trades_df.apply(
                     lambda row: calculate_profit(
-                        row['price_diff'],
+                        row['open_price'],
+                        row['close_price'],
                         direction,
                         position_size,
                         instrument_params,
