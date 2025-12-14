@@ -133,7 +133,8 @@ def get_ohlc_history(
     
     # Convert to DataFrame
     df = pd.DataFrame(rates)
-    df['time'] = pd.to_datetime(df['time'], unit='s')
+    # MT5 returns UTC timestamps, convert to timezone-naive UTC
+    df['time'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_localize(None)
     
     # Return only required columns in correct order
     return df[['time', 'open', 'high', 'low', 'close']].copy()

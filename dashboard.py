@@ -6,6 +6,10 @@ import numpy as np
 from datetime import datetime, time
 from backtester import BacktestEngine
 from strategy import MyPerfectStrategy
+from data_utils import (
+    normalize_csv_data, get_instrument_params, calculate_profit,
+    generate_trades_dt, generate_trades_swing
+)
 
 # Try to import MT5 utils (will work if ENABLE_MT5 = True)
 try:
@@ -55,22 +59,28 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# --- CACHING ---
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def cached_get_ohlc_history(symbol, timeframe, date_from, date_to):
+    """Cached MT5 data fetching."""
+    return get_ohlc_history(symbol, timeframe, date_from, date_to)
+
 # --- INITIALIZE SESSION STATE ---
 if 'current_tab' not in st.session_state:
     st.session_state['current_tab'] = 'Data'
 if 'mt5_connected' not in st.session_state:
     st.session_state['mt5_connected'] = False
+if 'selected_days' not in st.session_state:
+    st.session_state['selected_days'] = ['MON', 'TUE', 'WED', 'THU', 'FRI']
 
 # --- TOP NAVIGATION MENU ---
 col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 5])
 with col1:
-    if st.button("Data", use_container_width=True, type="primary" if st.session_state['current_tab'] == 'Data' else "secondary"):
+    if st.button("Data", use_container_width=True, type="primary" if st.session_state['current_tab'] == 'Data' else "secondary", key="nav_data"):
         st.session_state['current_tab'] = 'Data'
-        st.rerun()
 with col2:
-    if st.button("Market Mapper", use_container_width=True, type="primary" if st.session_state['current_tab'] == 'Market Mapper' else "secondary"):
+    if st.button("Market Mapper", use_container_width=True, type="primary" if st.session_state['current_tab'] == 'Market Mapper' else "secondary", key="nav_mapper"):
         st.session_state['current_tab'] = 'Market Mapper'
-        st.rerun()
 
 # --- TAB 1: DATA (MT5/CSV Connection + OHLC Chart) ---
 if st.session_state['current_tab'] == 'Data':
@@ -95,17 +105,15 @@ if st.session_state['current_tab'] == 'Data':
             
             if st.session_state['mt5_connected']:
                 st.success("✅ MT5 Connected")
-                if st.button("Disconnect MT5", use_container_width=True):
+                if st.button("Disconnect MT5", use_container_width=True, key="disconnect_mt5"):
                     shutdown_mt5()
                     st.session_state['mt5_connected'] = False
-                    st.rerun()
             else:
-                if st.button("Connect to MT5", type="primary", use_container_width=True):
+                if st.button("Connect to MT5", type="primary", use_container_width=True, key="connect_mt5"):
                     success, message = initialize_mt5()
                     if success:
                         st.session_state['mt5_connected'] = True
                         st.success(message)
-                        st.rerun()
                     else:
                         st.error(message)
             
@@ -131,7 +139,7 @@ if st.session_state['current_tab'] == 'Data':
                 if st.button("Fetch from MT5", type="primary", use_container_width=True):
                     try:
                         with st.spinner("Fetching data from MT5..."):
-                            df = get_ohlc_history(
+                            df = cached_get_ohlc_history(
                                 symbol=symbol,
                                 timeframe=timeframe,
                                 date_from=datetime.combine(start_date, datetime.min.time()),
@@ -141,7 +149,6 @@ if st.session_state['current_tab'] == 'Data':
                             st.session_state['data_symbol'] = symbol
                             st.session_state['data_timeframe'] = timeframe
                             st.success(f"✅ Fetched {len(df)} bars")
-                            st.rerun()
                     except Exception as e:
                         st.error(f"Error fetching data: {str(e)}")
                 
@@ -160,13 +167,11 @@ if st.session_state['current_tab'] == 'Data':
             
             if uploaded_file is not None:
                 try:
-                    df = pd.read_csv(uploaded_file)
-                    if 'time' in df.columns:
-                        df['time'] = pd.to_datetime(df['time'])
+                    df_raw = pd.read_csv(uploaded_file)
+                    df = normalize_csv_data(df_raw)
                     st.session_state['data'] = df
-                    st.session_state['data_symbol'] = uploaded_file.name
+                    st.session_state['data_symbol'] = uploaded_file.name.replace('.csv', '')
                     st.success(f"✅ Loaded {len(df)} rows")
-                    st.rerun()
                 except Exception as e:
                     st.error(f"Error loading CSV: {str(e)}")
             
@@ -194,7 +199,6 @@ if st.session_state['current_tab'] == 'Data':
                 st.session_state['data'] = df
                 st.session_state['data_symbol'] = "SIMULATION"
                 st.success(f"✅ Generated {len(df)} bars")
-                st.rerun()
             
             if 'data' in st.session_state and not st.session_state['data'].empty:
                 df = st.session_state['data']
@@ -272,9 +276,22 @@ elif st.session_state['current_tab'] == 'Market Mapper':
             
             col_comm_label, col_comm_input = st.columns([1, 2])
             with col_comm_label:
-                st.write("Commission per Lot:")
+                st.write("Commission per Lot (per side):")
             with col_comm_input:
-                commission_per_lot = st.number_input("", min_value=0.0, max_value=100.0, value=0.0, step=0.1, label_visibility="collapsed", help="Commission per lot per side (round turn = 2x)")
+                commission_per_lot = st.number_input("", min_value=0.0, max_value=100.0, value=0.0, step=0.1, label_visibility="collapsed", help="Commission per lot per side. Round-turn = 2x this value")
+            
+            # Advanced instrument parameters (collapsible)
+            with st.expander("Advanced: Instrument Parameters"):
+                symbol_name = st.session_state.get('data_symbol', 'DEFAULT')
+                instrument_params = get_instrument_params(symbol_name)
+                
+                st.write(f"**Detected Symbol:** {symbol_name}")
+                st.write(f"**Type:** {instrument_params['type']}")
+                st.write(f"**Contract Size:** {instrument_params['contract_size']:,}")
+                st.write(f"**Pip Size:** {instrument_params['pip_size']}")
+                st.write(f"**Pip Value per Lot:** ${instrument_params['pip_value_per_lot']:.2f}")
+                st.write(f"**Quote Currency:** {instrument_params['quote_currency']}")
+                st.caption("Parameters are auto-detected from symbol. Edit data_utils.py to customize.")
             
             st.markdown("---")
             
@@ -293,59 +310,26 @@ elif st.session_state['current_tab'] == 'Market Mapper':
                 with col_end_input:
                     end_hour = st.time_input("", value=time(15, 30), label_visibility="collapsed", help="Exit at first available bar ≥ this time")
                 
-                st.write("Days of Week")
                 days_of_week = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
-                
-                if 'selected_days' not in st.session_state:
-                    st.session_state['selected_days'] = ['MON', 'TUE', 'WED', 'THU', 'FRI'].copy()
-                
-                cols_row1 = st.columns(4)
-                with cols_row1[0]:
-                    if st.button("ALL", use_container_width=True, key="btn_all_days"):
-                        st.session_state['selected_days'] = days_of_week.copy()
-                        st.rerun()
-                
-                for i, day in enumerate(['MON', 'TUE', 'WED']):
-                    with cols_row1[i+1]:
-                        is_selected = day in st.session_state['selected_days']
-                        if st.button(
-                            day,
-                            use_container_width=True,
-                            type="primary" if is_selected else "secondary",
-                            key=f"btn_{day}"
-                        ):
-                            if is_selected:
-                                st.session_state['selected_days'].remove(day)
-                            else:
-                                st.session_state['selected_days'].append(day)
-                            st.rerun()
-                
-                cols_row2 = st.columns(4)
-                for i, day in enumerate(['THU', 'FRI', 'SAT', 'SUN']):
-                    with cols_row2[i]:
-                        is_selected = day in st.session_state['selected_days']
-                        if st.button(
-                            day,
-                            use_container_width=True,
-                            type="primary" if is_selected else "secondary",
-                            key=f"btn_{day}"
-                        ):
-                            if is_selected:
-                                st.session_state['selected_days'].remove(day)
-                            else:
-                                st.session_state['selected_days'].append(day)
-                            st.rerun()
-                
-                # Get selected days from session state
-                selected_days = st.session_state.get('selected_days', ['MON', 'TUE', 'WED', 'THU', 'FRI'])
+                selected_days = st.multiselect(
+                    "Days of Week",
+                    days_of_week,
+                    default=st.session_state.get('selected_days', ['MON', 'TUE', 'WED', 'THU', 'FRI']),
+                    key="days_multiselect"
+                )
+                st.session_state['selected_days'] = selected_days
             else:
                 # Swing mode - no time restrictions, but still filter by days
                 start_hour = None
                 end_hour = None
-                # Initialize selected days if not set
-                if 'selected_days' not in st.session_state:
-                    st.session_state['selected_days'] = ['MON', 'TUE', 'WED', 'THU', 'FRI']
-                selected_days = st.session_state.get('selected_days', ['MON', 'TUE', 'WED', 'THU', 'FRI'])
+                days_of_week = ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN']
+                selected_days = st.multiselect(
+                    "Days of Week",
+                    days_of_week,
+                    default=st.session_state.get('selected_days', ['MON', 'TUE', 'WED', 'THU', 'FRI']),
+                    key="days_multiselect_swing"
+                )
+                st.session_state['selected_days'] = selected_days
         
         with col_right:
             # Apply filters to data
@@ -357,139 +341,35 @@ elif st.session_state['current_tab'] == 'Market Mapper':
             selected_day_nums = [day_map[d] for d in selected_days if d in day_map]
             filtered_df = filtered_df[filtered_df['day_of_week'].isin(selected_day_nums)]
             
-            # Calculate trades based on mode
-            if mode == "DT":
-                # Day Trading: One trade per day
-                # Entry: First bar at or after start hour within the day
-                # Exit: First bar at or after end hour (can be same day or next day)
-                filtered_df = filtered_df.sort_values('time').reset_index(drop=True)
-                filtered_df['date'] = filtered_df['time'].dt.date
-                filtered_df['hour'] = filtered_df['time'].dt.hour
-                filtered_df['minute'] = filtered_df['time'].dt.minute
-                filtered_df['time_of_day'] = filtered_df['hour'] * 60 + filtered_df['minute']
-                
-                start_minutes = start_hour.hour * 60 + start_hour.minute
-                end_minutes = end_hour.hour * 60 + end_hour.minute
-                
-                # Group by date and find entry/exit bars
-                trades = []
-                dates = sorted(filtered_df['date'].unique())
-                
-                for i, date in enumerate(dates):
-                    day_data = filtered_df[filtered_df['date'] == date]
-                    
-                    # Find entry bar: first bar at or after start hour
-                    # Entry will only occur if a bar exists within or after the start hour
-                    entry_bars = day_data[day_data['time_of_day'] >= start_minutes]
-                    if len(entry_bars) == 0:
-                        continue  # No entry bar found for this day
-                    entry_bar = entry_bars.iloc[0]
-                    
-                    # Find exit bar (first bar >= end hour, must be after entry)
-                    # First try same day
-                    exit_bars_same_day = day_data[
-                        (day_data['time_of_day'] >= end_minutes) & 
-                        (day_data['time'] > entry_bar['time'])
-                    ]
-                    
-                    if len(exit_bars_same_day) > 0:
-                        exit_bar = exit_bars_same_day.iloc[0]
-                    else:
-                        # If no exit bar found on same day at or after end hour,
-                        # use the last bar of the day (if it's after entry)
-                        bars_after_entry = day_data[day_data['time'] > entry_bar['time']]
-                        if len(bars_after_entry) > 0:
-                            exit_bar = bars_after_entry.iloc[-1]  # Last bar of the day
-                        else:
-                            continue  # No bar found after entry on this day
-                    
-                    # Calculate profit in dollars
-                    if direction == "Long":
-                        price_diff = exit_bar['close'] - entry_bar['open']
-                    else:  # Short
-                        price_diff = entry_bar['open'] - exit_bar['close']
-                    
-                    # Convert price difference to dollars
-                    # For forex: 1 lot = 100,000 units, 1 pip (0.0001) = $10 per lot
-                    # For crypto: 1 lot = 1 unit (e.g., 1 BTC)
-                    # Use pip value calculation: price_diff * pip_value_multiplier * position_size
-                    # pip_value_multiplier = 100000 for forex (0.0001 * 100000 = $10 per pip per lot)
-                    # pip_value_multiplier = 1 for crypto (1 * 1 = $1 per $1 move per lot)
-                    
-                    # Detect if crypto (price > 1000) or forex (price < 10)
-                    avg_price = (entry_bar['open'] + exit_bar['close']) / 2
-                    if avg_price > 1000:  # Likely crypto
-                        pip_value_multiplier = 1  # 1 lot = 1 unit
-                    else:  # Likely forex
-                        pip_value_multiplier = 100000  # 1 lot = 100,000 units
-                    
-                    profit_dollars = (price_diff * pip_value_multiplier * position_size) - (commission_per_lot * position_size * 2)  # Round turn commission
-                    
-                    trades.append({
-                        'date': date,
-                        'entry_time': entry_bar['time'],
-                        'exit_time': exit_bar['time'],
-                        'open_price': entry_bar['open'],
-                        'close_price': exit_bar['close'],
-                        'profit': profit_dollars
-                    })
-                
-                if len(trades) == 0:
-                    st.warning("No trades found matching the selected filters")
-                    filtered_df = pd.DataFrame()
-                else:
-                    # Create DataFrame from trades
-                    filtered_df = pd.DataFrame(trades)
-                    filtered_df['cumulative_equity'] = filtered_df['profit'].cumsum()
-                    filtered_df['trade_number'] = range(1, len(filtered_df) + 1)
+            # Get instrument parameters for profit calculation
+            symbol_name = st.session_state.get('data_symbol', 'DEFAULT')
+            instrument_params = get_instrument_params(symbol_name)
             
+            # Generate trades based on mode
+            if mode == "DT":
+                trades_df = generate_trades_dt(filtered_df, start_hour, end_hour, selected_days, direction)
             else:
-                # Swing Trading: One trade per day (open to close of same day)
-                filtered_df = filtered_df.sort_values('time').reset_index(drop=True)
-                filtered_df['date'] = filtered_df['time'].dt.date
+                trades_df = generate_trades_swing(filtered_df, direction)
+            
+            if len(trades_df) == 0:
+                st.warning("No trades found matching the selected filters")
+                filtered_df = pd.DataFrame()
+            else:
+                # Calculate profit for each trade
+                trades_df['profit'] = trades_df.apply(
+                    lambda row: calculate_profit(
+                        row['price_diff'],
+                        direction,
+                        position_size,
+                        instrument_params,
+                        commission_per_lot
+                    ),
+                    axis=1
+                )
                 
-                # Group by date and get first open and last close of each day
-                trades = []
-                for date, day_data in filtered_df.groupby('date'):
-                    if len(day_data) == 0:
-                        continue
-                    
-                    first_bar = day_data.iloc[0]
-                    last_bar = day_data.iloc[-1]
-                    
-                    # Calculate profit in dollars
-                    if direction == "Long":
-                        price_diff = last_bar['close'] - first_bar['open']
-                    else:  # Short
-                        price_diff = first_bar['open'] - last_bar['close']
-                    
-                    # Convert price difference to dollars
-                    # Detect if crypto (price > 1000) or forex (price < 10)
-                    avg_price = (first_bar['open'] + last_bar['close']) / 2
-                    if avg_price > 1000:  # Likely crypto
-                        pip_value_multiplier = 1  # 1 lot = 1 unit
-                    else:  # Likely forex
-                        pip_value_multiplier = 100000  # 1 lot = 100,000 units
-                    
-                    profit_dollars = (price_diff * pip_value_multiplier * position_size) - (commission_per_lot * position_size * 2)  # Round turn commission
-                    
-                    trades.append({
-                        'date': date,
-                        'entry_time': first_bar['time'],
-                        'exit_time': last_bar['time'],
-                        'open_price': first_bar['open'],
-                        'close_price': last_bar['close'],
-                        'profit': profit_dollars
-                    })
-                
-                if len(trades) == 0:
-                    st.warning("No trades found matching the selected filters")
-                    filtered_df = pd.DataFrame()
-                else:
-                    # Create DataFrame from trades
-                    filtered_df = pd.DataFrame(trades)
-                    filtered_df['cumulative_equity'] = filtered_df['profit'].cumsum()
-                    filtered_df['trade_number'] = range(1, len(filtered_df) + 1)
+                filtered_df = trades_df[['date', 'entry_time', 'exit_time', 'open_price', 'close_price', 'profit']].copy()
+                filtered_df['cumulative_equity'] = filtered_df['profit'].cumsum()
+                filtered_df['trade_number'] = range(1, len(filtered_df) + 1)
             
             if len(filtered_df) == 0:
                 st.warning("No data matches the selected filters")
