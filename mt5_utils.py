@@ -136,8 +136,22 @@ def get_ohlc_history(
     # MT5 returns UTC timestamps, convert to timezone-naive UTC
     df['time'] = pd.to_datetime(df['time'], unit='s', utc=True).dt.tz_localize(None)
     
-    # Return only required columns in correct order
-    return df[['time', 'open', 'high', 'low', 'close']].copy()
+    # Select columns - include volume if available
+    # MT5 typically provides 'tick_volume' (number of ticks) and sometimes 'real_volume' (actual traded volume)
+    base_columns = ['time', 'open', 'high', 'low', 'close']
+    
+    # Check for volume columns and rename to 'volume' for consistency
+    if 'tick_volume' in df.columns:
+        df = df.rename(columns={'tick_volume': 'volume'})
+        base_columns.append('volume')
+    elif 'real_volume' in df.columns:
+        df = df.rename(columns={'real_volume': 'volume'})
+        base_columns.append('volume')
+    elif 'volume' in df.columns:
+        base_columns.append('volume')
+    
+    # Return columns in correct order
+    return df[base_columns].copy()
 
 
 def get_available_symbols() -> list:

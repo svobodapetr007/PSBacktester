@@ -121,7 +121,38 @@ if st.session_state['current_tab'] == 'Data':
             if st.session_state.get('mt5_connected', False):
                 st.subheader("Fetch Data")
                 
-                symbol = st.text_input("Symbol", value="BTCUSD", help="e.g., EURUSD, BTCUSD, GBPUSD")
+                # Get available symbols from MT5
+                if 'mt5_symbols' not in st.session_state:
+                    with st.spinner("Loading available symbols..."):
+                        st.session_state['mt5_symbols'] = get_available_symbols()
+                
+                symbols_list = st.session_state.get('mt5_symbols', [])
+                
+                if len(symbols_list) > 0:
+                    # Use selectbox if symbols are available
+                    default_idx = 0
+                    if 'BTCUSD' in symbols_list:
+                        default_idx = symbols_list.index('BTCUSD')
+                    elif 'EURUSD' in symbols_list:
+                        default_idx = symbols_list.index('EURUSD')
+                    
+                    col_symbol_select, col_symbol_refresh = st.columns([3, 1])
+                    with col_symbol_select:
+                        symbol = st.selectbox(
+                            "Symbol",
+                            options=symbols_list,
+                            index=default_idx,
+                            help="Select symbol from available MT5 symbols"
+                        )
+                    with col_symbol_refresh:
+                        st.write("")  # Spacer
+                        if st.button("🔄", help="Refresh symbol list", key="refresh_symbols"):
+                            st.session_state['mt5_symbols'] = get_available_symbols()
+                else:
+                    # Fallback to text input if no symbols loaded
+                    symbol = st.text_input("Symbol", value="BTCUSD", help="e.g., EURUSD, BTCUSD, GBPUSD")
+                    if st.button("Refresh Symbols", use_container_width=True, key="refresh_symbols_fallback"):
+                        st.session_state['mt5_symbols'] = get_available_symbols()
                 
                 timeframe = st.selectbox(
                     "Timeframe",
@@ -130,21 +161,23 @@ if st.session_state['current_tab'] == 'Data':
                     help="Select the chart timeframe"
                 )
                 
-                col1, col2 = st.columns(2)
-                with col1:
+                col_date_start, col_date_end = st.columns(2)
+                with col_date_start:
                     start_date = st.date_input("Start Date", value=datetime(2025, 1, 1))
-                with col2:
+                with col_date_end:
                     end_date = st.date_input("End Date", value=datetime.now())
                 
                 if st.button("Fetch from MT5", type="primary", use_container_width=True):
                     try:
                         with st.spinner("Fetching data from MT5..."):
-                            df = cached_get_ohlc_history(
+                            df_raw = cached_get_ohlc_history(
                                 symbol=symbol,
                                 timeframe=timeframe,
                                 date_from=datetime.combine(start_date, datetime.min.time()),
                                 date_to=datetime.combine(end_date, datetime.max.time())
                             )
+                            # Normalize all data sources for consistency
+                            df = normalize_csv_data(df_raw)
                             st.session_state['data'] = df
                             st.session_state['data_symbol'] = symbol
                             st.session_state['data_timeframe'] = timeframe
@@ -187,18 +220,23 @@ if st.session_state['current_tab'] == 'Data':
             volatility = st.slider("Volatility", 0.001, 0.010, 0.005, step=0.001)
             
             if st.button("Generate Data", use_container_width=True):
-                dates = pd.date_range(start='2023-01-01', periods=rows, freq='H')
-                price_walk = 1.10 + np.cumsum(np.random.normal(0, volatility, rows))
-                df = pd.DataFrame({
-                    'time': dates,
-                    'open': price_walk,
-                    'high': price_walk + volatility/2,
-                    'low': price_walk - volatility/2,
-                    'close': price_walk + np.random.normal(0, volatility/10, rows)
-                })
-                st.session_state['data'] = df
-                st.session_state['data_symbol'] = "SIMULATION"
-                st.success(f"✅ Generated {len(df)} bars")
+                try:
+                    dates = pd.date_range(start='2023-01-01', periods=rows, freq='H')
+                    price_walk = 1.10 + np.cumsum(np.random.normal(0, volatility, rows))
+                    df_raw = pd.DataFrame({
+                        'time': dates,
+                        'open': price_walk,
+                        'high': price_walk + volatility/2,
+                        'low': price_walk - volatility/2,
+                        'close': price_walk + np.random.normal(0, volatility/10, rows)
+                    })
+                    # Normalize all data sources for consistency
+                    df = normalize_csv_data(df_raw)
+                    st.session_state['data'] = df
+                    st.session_state['data_symbol'] = "SIMULATION"
+                    st.success(f"✅ Generated {len(df)} bars")
+                except Exception as e:
+                    st.error(f"Error generating data: {str(e)}")
             
             if 'data' in st.session_state and not st.session_state['data'].empty:
                 df = st.session_state['data']
@@ -209,30 +247,88 @@ if st.session_state['current_tab'] == 'Data':
         if 'data' in st.session_state and not st.session_state['data'].empty:
             df = st.session_state['data']
             
-            # Create candlestick chart
-            fig = go.Figure(data=[go.Candlestick(
-                x=df['time'],
-                open=df['open'],
-                high=df['high'],
-                low=df['low'],
-                close=df['close'],
-                name='OHLC'
-            )])
+            # Check if volume is available
+            has_volume = 'volume' in df.columns
             
             symbol_name = st.session_state.get('data_symbol', 'Data')
-            fig.update_layout(
-                title=f"{symbol_name} - OHLC Chart",
-                xaxis_title="Time",
-                yaxis_title="Price",
-                height=600,
-                xaxis_rangeslider_visible=False,
-                template="plotly_dark"
-            )
+            
+            # Create candlestick chart
+            if has_volume:
+                # Create subplots: price on top, volume on bottom
+                from plotly.subplots import make_subplots
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.03,
+                    row_heights=[0.8, 0.2],
+                    subplot_titles=(f"{symbol_name} - OHLC Chart", None)
+                )
+                
+                # Add candlestick to first subplot
+                fig.add_trace(
+                    go.Candlestick(
+                        x=df['time'],
+                        open=df['open'],
+                        high=df['high'],
+                        low=df['low'],
+                        close=df['close'],
+                        name="Price"
+                    ),
+                    row=1, col=1
+                )
+                
+                # Add volume bars to second subplot matching OHLC candle colors (vectorized)
+                colors = np.where(df['close'] < df['open'], '#ef5350', '#26a69a')
+                fig.add_trace(
+                    go.Bar(
+                        x=df['time'],
+                        y=df['volume'],
+                        name="Volume",
+                        marker=dict(
+                            color=colors,
+                            line=dict(width=0),
+                            opacity=1.0  # Full opacity
+                        ),
+                        showlegend=False
+                    ),
+                    row=2, col=1
+                )
+                
+                fig.update_layout(
+                    height=700,
+                    template="plotly_dark",
+                    xaxis_rangeslider_visible=False,
+                    showlegend=False
+                )
+                
+                fig.update_xaxes(title_text="Time", row=2, col=1)
+                fig.update_yaxes(title_text="Price", row=1, col=1)
+                fig.update_yaxes(title_text="Volume", row=2, col=1, showgrid=False)
+            else:
+                # Single chart without volume
+                fig = go.Figure(data=[go.Candlestick(
+                    x=df['time'],
+                    open=df['open'],
+                    high=df['high'],
+                    low=df['low'],
+                    close=df['close'],
+                    name='OHLC'
+                )])
+                
+                fig.update_layout(
+                    title=f"{symbol_name} - OHLC Chart",
+                    xaxis_title="Time",
+                    yaxis_title="Price",
+                    height=600,
+                    xaxis_rangeslider_visible=False,
+                    template="plotly_dark"
+                )
             
             st.plotly_chart(fig, use_container_width=True)
             
-            # Data info
-            st.caption(f"Total bars: {len(df)} | Period: {df['time'].min()} to {df['time'].max()}")
+            # Data info with volume availability
+            volume_info = "" if has_volume else " | (Volume not available)"
+            st.caption(f"Total bars: {len(df)} | Period: {df['time'].min()} to {df['time'].max()}{volume_info}")
         else:
             st.info("👈 Load data from the left panel to view the chart")
 
@@ -364,9 +460,10 @@ elif st.session_state['current_tab'] == 'Market Mapper':
             instrument_params = get_instrument_params(symbol_name)
             
             # Generate trades based on mode (with spread/slippage applied)
+            # Note: selected_days filtering is done upstream, so we don't pass it to generate_trades_dt
             if mode == "DT":
                 trades_df = generate_trades_dt(
-                    filtered_df, start_hour, end_hour, selected_days, direction,
+                    filtered_df, start_hour, end_hour, direction,
                     spread_pips, slippage_pips, instrument_params
                 )
             else:

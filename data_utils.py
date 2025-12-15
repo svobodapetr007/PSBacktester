@@ -60,15 +60,21 @@ def normalize_csv_data(df: pd.DataFrame) -> pd.DataFrame:
     Normalize CSV data to standard format.
     Handles various column name formats and ensures required columns exist.
     
+    Timezone Policy:
+    - Timezone-aware timestamps are converted to UTC, then made timezone-naive
+    - Timezone-naive timestamps are assumed to be in UTC
+    - All returned timestamps are timezone-naive (for consistent processing)
+    
     Args:
         df: Raw DataFrame from CSV
     
     Returns:
-        Normalized DataFrame with columns: ['time', 'open', 'high', 'low', 'close']
+        Normalized DataFrame with columns: ['time', 'open', 'high', 'low', 'close'] (and optionally 'volume')
     
     Raises:
         ValueError: If required columns cannot be found or created
     """
+    # Create a copy to avoid SettingWithCopyWarning
     df = df.copy()
     
     # Column name mapping (case-insensitive)
@@ -78,6 +84,7 @@ def normalize_csv_data(df: pd.DataFrame) -> pd.DataFrame:
         'high': ['high', 'h', 'highprice'],
         'low': ['low', 'l', 'lowprice'],
         'close': ['close', 'c', 'closeprice', 'price'],
+        'volume': ['volume', 'vol', 'tick_volume', 'real_volume', 'v'],  # Optional volume column
     }
     
     # Normalize column names (lowercase, strip whitespace)
@@ -89,32 +96,39 @@ def normalize_csv_data(df: pd.DataFrame) -> pd.DataFrame:
         found = False
         for name in possible_names:
             if name in df.columns:
-                normalized_df[target_col] = df[name]
+                normalized_df[target_col] = df[name].copy()
                 found = True
                 break
         
-        if not found:
+        # Volume is optional, other columns are required
+        if not found and target_col != 'volume':
             raise ValueError(f"Required column '{target_col}' not found. Available columns: {list(df.columns)}")
     
     # Ensure time is datetime
     if not pd.api.types.is_datetime64_any_dtype(normalized_df['time']):
-        normalized_df['time'] = pd.to_datetime(normalized_df['time'], errors='coerce')
+        normalized_df['time'] = pd.to_datetime(normalized_df['time'], errors='coerce', utc=False)
     
     # Ensure numeric columns are numeric
     for col in ['open', 'high', 'low', 'close']:
         normalized_df[col] = pd.to_numeric(normalized_df[col], errors='coerce')
     
-    # Remove rows with NaN values
-    normalized_df = normalized_df.dropna()
+    # Remove rows with NaN values in required columns only
+    normalized_df = normalized_df.dropna(subset=['time', 'open', 'high', 'low', 'close']).copy()
     
     # Sort by time
     normalized_df = normalized_df.sort_values('time').reset_index(drop=True)
     
-    # Ensure timezone-naive (convert to UTC if timezone-aware, then remove timezone)
+    # Timezone handling: convert to UTC if timezone-aware, then make naive
+    # Timezone-naive timestamps are assumed to be UTC
     if normalized_df['time'].dt.tz is not None:
         normalized_df['time'] = normalized_df['time'].dt.tz_convert('UTC').dt.tz_localize(None)
     
-    return normalized_df[['time', 'open', 'high', 'low', 'close']].copy()
+    # Select columns - include volume if available
+    base_columns = ['time', 'open', 'high', 'low', 'close']
+    if 'volume' in normalized_df.columns:
+        base_columns.append('volume')
+    
+    return normalized_df[base_columns].copy()
 
 
 def apply_spread_slippage(
@@ -175,14 +189,30 @@ def calculate_profit(
         exit_price: Exit price (already adjusted for spread/slippage)
         direction: 'Long' or 'Short'
         position_size: Position size in lots
-        instrument_params: Instrument parameters dictionary
+        instrument_params: Instrument parameters dictionary (must contain 'pip_size' and 'pip_value_per_lot')
         commission_per_side: Commission per lot per side (not round-turn)
     
     Returns:
         Profit in quote currency (dollars for USD pairs)
+    
+    Raises:
+        KeyError: If required instrument_params keys are missing
+        ValueError: If instrument_params values are invalid
     """
+    # Validate required keys
+    required_keys = ['pip_size', 'pip_value_per_lot']
+    missing_keys = [key for key in required_keys if key not in instrument_params]
+    if missing_keys:
+        raise KeyError(f"Missing required instrument parameters: {missing_keys}. Available keys: {list(instrument_params.keys())}")
+    
     pip_size = instrument_params['pip_size']
     pip_value_per_lot = instrument_params['pip_value_per_lot']
+    
+    # Validate values
+    if pip_size <= 0:
+        raise ValueError(f"pip_size must be > 0, got {pip_size}")
+    if pip_value_per_lot < 0:
+        raise ValueError(f"pip_value_per_lot must be >= 0, got {pip_value_per_lot}")
     
     # Calculate price difference
     if direction == "Long":
@@ -203,7 +233,6 @@ def generate_trades_dt(
     df: pd.DataFrame,
     start_hour: time,
     end_hour: time,
-    selected_days: list,
     direction: str,
     spread_pips: float = 0.0,
     slippage_pips: float = 0.0,
@@ -213,16 +242,27 @@ def generate_trades_dt(
     Generate day trading trades (one per day).
     Handles cross-midnight scenarios (e.g., start=22:00, end=02:00).
     
+    Note: Day-of-week filtering should be done upstream before calling this function.
+    
     Args:
-        df: Filtered DataFrame with day_of_week column
+        df: DataFrame already filtered by day_of_week (filtering happens upstream)
         start_hour: Start hour for entry
         end_hour: End hour for exit
-        selected_days: List of selected day names (e.g., ['MON', 'TUE'])
         direction: 'Long' or 'Short'
+        spread_pips: Spread in pips (default: 0.0)
+        slippage_pips: Additional slippage in pips (default: 0.0)
+        instrument_params: Instrument parameters dict (required if spread/slippage > 0)
     
     Returns:
         DataFrame with trades
+    
+    Raises:
+        ValueError: If instrument_params is None when spread/slippage is applied
     """
+    # Validate instrument_params if spread/slippage is used
+    if (spread_pips > 0 or slippage_pips > 0) and instrument_params is None:
+        raise ValueError("instrument_params is required when spread_pips or slippage_pips > 0")
+    
     df = df.sort_values('time').reset_index(drop=True).copy()
     df['date'] = df['time'].dt.date
     df['hour'] = df['time'].dt.hour
@@ -239,7 +279,7 @@ def generate_trades_dt(
     dates = sorted(df['date'].unique())
     
     for i, date in enumerate(dates):
-        day_data = df[df['date'] == date]
+        day_data = df[df['date'] == date].copy()
         
         # Find entry bar (first bar at or after start hour)
         entry_bars = day_data[day_data['time_of_day'] >= start_minutes]
@@ -344,21 +384,31 @@ def generate_trades_swing(
     """
     Generate swing trading trades (one per day, open to close).
     
+    Note: Day-of-week filtering should be done upstream before calling this function.
+    
     Args:
-        df: Filtered DataFrame
+        df: DataFrame already filtered by day_of_week (filtering happens upstream)
         direction: 'Long' or 'Short'
-        spread_pips: Spread in pips
-        slippage_pips: Additional slippage in pips
-        instrument_params: Instrument parameters dictionary
+        spread_pips: Spread in pips (default: 0.0)
+        slippage_pips: Additional slippage in pips (default: 0.0)
+        instrument_params: Instrument parameters dict (required if spread/slippage > 0)
     
     Returns:
         DataFrame with trades
+    
+    Raises:
+        ValueError: If instrument_params is None when spread/slippage is applied
     """
+    # Validate instrument_params if spread/slippage is used
+    if (spread_pips > 0 or slippage_pips > 0) and instrument_params is None:
+        raise ValueError("instrument_params is required when spread_pips or slippage_pips > 0")
+    
     df = df.sort_values('time').reset_index(drop=True).copy()
     df['date'] = df['time'].dt.date
     
     trades = []
     for date, day_data in df.groupby('date'):
+        day_data = day_data.copy()
         if len(day_data) == 0:
             continue
         
