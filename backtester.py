@@ -53,7 +53,7 @@ class Strategy:
 
 # --- 3. THE ENGINE ---
 class BacktestEngine:
-    def __init__(self, data: pd.DataFrame, strategy: Strategy, initial_balance=10000, commission=2.5):
+    def __init__(self, data: pd.DataFrame, strategy: Strategy, initial_balance=10000, commission=2.5, instrument_params=None):
         # Prepare Data
         self.data = data.copy()
         if 'time' in self.data.columns:
@@ -64,6 +64,7 @@ class BacktestEngine:
         self.balance = initial_balance
         self.commission = commission # per lot per side
         self.spread = 0.00010 # Simulated spread (1 pip)
+        self.instrument_params = instrument_params
         
         self.active_trades: List[Trade] = []
         self.closed_trades: List[Trade] = []
@@ -136,6 +137,8 @@ class BacktestEngine:
 
     def _open_trade(self, order, price, time):
         self.trade_counter += 1
+        # Calculate commission (will be used if not using instrument_params)
+        commission_total = self.commission * order['volume'] * 2  # Round turn
         t = Trade(
             ticket=self.trade_counter,
             symbol="TEST",
@@ -145,7 +148,7 @@ class BacktestEngine:
             volume=order['volume'],
             sl=order['sl'],
             tp=order['tp'],
-            commission=self.commission * order['volume'] * 2 # Round turn
+            commission=commission_total
         )
         self.active_trades.append(t)
 
@@ -154,10 +157,27 @@ class BacktestEngine:
         trade.close_price = price
         trade.exit_reason = reason
         
-        # Calculate Profit
-        multiplier = 1 if trade.direction == 'long' else -1
-        trade.profit = (trade.close_price - trade.open_price) * multiplier * trade.volume * 100000 # Standard Lot size
-        trade.profit -= trade.commission # Deduct commission
+        # Calculate Profit using instrument-aware calculation
+        if self.instrument_params is not None:
+            # Use the existing calculate_profit function from data_utils
+            from data_utils import calculate_profit
+            direction_str = 'Long' if trade.direction == 'long' else 'Short'
+            # calculate_profit includes commission, so we use it directly
+            trade.profit = calculate_profit(
+                trade.open_price,
+                trade.close_price,
+                direction_str,
+                trade.volume,
+                self.instrument_params,
+                self.commission  # commission_per_side
+            )
+            # Update trade.commission to match what was actually deducted
+            trade.commission = self.commission * trade.volume * 2
+        else:
+            # Fallback to old calculation if no instrument params (for backward compatibility)
+            multiplier = 1 if trade.direction == 'long' else -1
+            trade.profit = (trade.close_price - trade.open_price) * multiplier * trade.volume * 100000
+            trade.profit -= trade.commission  # Commission already calculated in _open_trade
         
         self.balance += trade.profit
         self.active_trades.remove(trade)

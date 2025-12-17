@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import numpy as np
 from datetime import datetime, time
 from backtester import BacktestEngine
@@ -10,6 +11,7 @@ from data_utils import (
     normalize_csv_data, get_instrument_params, calculate_profit,
     generate_trades_dt, generate_trades_swing
 )
+from strategy_builder import ConfigurableStrategy
 
 # Try to import MT5 utils (will work if ENABLE_MT5 = True)
 try:
@@ -74,13 +76,16 @@ if 'selected_days' not in st.session_state:
     st.session_state['selected_days'] = ['MON', 'TUE', 'WED', 'THU', 'FRI']
 
 # --- TOP NAVIGATION MENU ---
-col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 5])
+col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 4])
 with col1:
     if st.button("Data", use_container_width=True, type="primary" if st.session_state['current_tab'] == 'Data' else "secondary", key="nav_data"):
         st.session_state['current_tab'] = 'Data'
 with col2:
     if st.button("Market Mapper", use_container_width=True, type="primary" if st.session_state['current_tab'] == 'Market Mapper' else "secondary", key="nav_mapper"):
         st.session_state['current_tab'] = 'Market Mapper'
+with col3:
+    if st.button("Strategy Tester", use_container_width=True, type="primary" if st.session_state['current_tab'] == 'Strategy Tester' else "secondary", key="nav_strategy"):
+        st.session_state['current_tab'] = 'Strategy Tester'
 
 # --- TAB 1: DATA (MT5/CSV Connection + OHLC Chart) ---
 if st.session_state['current_tab'] == 'Data':
@@ -593,3 +598,450 @@ elif st.session_state['current_tab'] == 'Market Mapper':
                     display_df['Profit ($)'] = display_df['Profit ($)'].apply(lambda x: f"${x:,.2f}")
                     display_df['Cumulative Equity ($)'] = display_df['Cumulative Equity ($)'].apply(lambda x: f"${x:,.2f}")
                     st.dataframe(display_df, use_container_width=True, height=600)
+
+# --- TAB 3: STRATEGY TESTER ---
+elif st.session_state['current_tab'] == 'Strategy Tester':
+    if 'data' not in st.session_state or st.session_state['data'].empty:
+        st.warning("⚠️ Please load data first in the 'Data' tab")
+        st.info("Go to Data tab to connect MT5 or upload CSV file")
+    else:
+        df = st.session_state['data'].copy()
+        
+        col_left, col_right = st.columns([0.7, 2.3])
+        
+        with col_left:
+            st.subheader("Strategy Configuration")
+            
+            # Session selector
+            session_mode = st.radio(
+                "Session",
+                ["Use mapped session", "Use all market time"],
+                help="Use mapped session applies day/time filters from Market Mapper, otherwise use all data"
+            )
+            
+            st.markdown("---")
+            
+            # Direction selector
+            direction_mode = st.radio(
+                "Direction:",
+                ["Long", "Short", "Both"],
+                index=2,  # Default to "Both"
+                horizontal=True,
+                key="strategy_direction"
+            )
+            
+            st.markdown("---")
+            
+            # Entry Strategy
+            st.write("**Entry Strategy**")
+            entry_type = st.selectbox(
+                "Entry",
+                ["SMA Crossover", "RSI Threshold", "MACD Cross"],
+                key="entry_strategy"
+            )
+            
+            entry_params = {}
+            
+            if entry_type == "SMA Crossover":
+                col_fast, col_slow = st.columns(2)
+                with col_fast:
+                    entry_params['fast'] = st.number_input("Fast SMA", min_value=1, max_value=200, value=10, step=1, key="sma_fast")
+                with col_slow:
+                    entry_params['slow'] = st.number_input("Slow SMA", min_value=1, max_value=200, value=50, step=1, key="sma_slow")
+            
+            elif entry_type == "RSI Threshold":
+                entry_mode = st.radio("Mode", ["Mean Reversion", "Momentum"], key="rsi_mode")
+                entry_params['mode'] = entry_mode.lower().replace(' ', '_')
+                col_len, col_os, col_ob = st.columns(3)
+                with col_len:
+                    entry_params['length'] = st.number_input("RSI Length", min_value=2, max_value=50, value=14, step=1, key="rsi_length")
+                with col_os:
+                    entry_params['oversold'] = st.number_input("Oversold", min_value=0, max_value=50, value=30, step=1, key="rsi_oversold")
+                with col_ob:
+                    entry_params['overbought'] = st.number_input("Overbought", min_value=50, max_value=100, value=70, step=1, key="rsi_overbought")
+            
+            elif entry_type == "MACD Cross":
+                col_fast, col_slow, col_sig = st.columns(3)
+                with col_fast:
+                    entry_params['fast'] = st.number_input("Fast", min_value=1, max_value=50, value=12, step=1, key="macd_fast")
+                with col_slow:
+                    entry_params['slow'] = st.number_input("Slow", min_value=1, max_value=50, value=26, step=1, key="macd_slow")
+                with col_sig:
+                    entry_params['signal'] = st.number_input("Signal", min_value=1, max_value=50, value=9, step=1, key="macd_signal")
+                entry_mode = st.radio("Entry Mode", ["Histogram Cross", "Signal Cross"], key="macd_entry_mode")
+                entry_params['mode'] = entry_mode.lower().replace(' ', '_')
+            
+            st.markdown("---")
+            
+            # Exit Strategy
+            st.write("**Exit Strategy**")
+            exit_options = ["Fixed TP/SL (ATR)", "ATR Trailing Stop", "SMA Cross Back"]
+            
+            # Auto-select SMA Cross Back exit when SMA entry is selected
+            if entry_type == "SMA Crossover":
+                if 'exit_strategy' not in st.session_state or st.session_state.get('exit_strategy') != "SMA Cross Back":
+                    st.session_state['exit_strategy'] = "SMA Cross Back"
+                default_exit_index = 2  # SMA Cross Back
+            else:
+                # Keep current selection if it exists, otherwise default to first option
+                current_exit = st.session_state.get('exit_strategy', exit_options[0])
+                default_exit_index = exit_options.index(current_exit) if current_exit in exit_options else 0
+            
+            exit_type = st.selectbox(
+                "Exit",
+                exit_options,
+                key="exit_strategy",
+                index=default_exit_index
+            )
+            
+            exit_params = {}
+            
+            if exit_type == "Fixed TP/SL (ATR)":
+                col_atr_len, col_sl, col_tp = st.columns(3)
+                with col_atr_len:
+                    exit_params['atr_length'] = st.number_input("ATR Length", min_value=1, max_value=50, value=14, step=1, key="atr_length")
+                with col_sl:
+                    exit_params['sl_atr_mult'] = st.number_input("SL (ATR)", min_value=0.1, max_value=10.0, value=1.0, step=0.1, key="sl_atr")
+                with col_tp:
+                    exit_params['tp_atr_mult'] = st.number_input("TP (ATR)", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="tp_atr")
+            
+            elif exit_type == "ATR Trailing Stop":
+                col_atr_len, col_mult = st.columns(2)
+                with col_atr_len:
+                    exit_params['atr_length'] = st.number_input("ATR Length", min_value=1, max_value=50, value=14, step=1, key="atr_length_trail")
+                with col_mult:
+                    exit_params['atr_multiplier'] = st.number_input("ATR Multiplier", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="atr_mult")
+            
+            elif exit_type == "SMA Cross Back":
+                st.info("Uses reverse of entry strategy (e.g., SMA cross back for SMA entry)")
+            
+            st.markdown("---")
+            
+            # Position and Costs
+            st.write("**Position & Costs**")
+            position_size = st.number_input("Position Size (Lots)", min_value=0.01, max_value=100.0, value=1.0, step=0.01, key="strat_pos_size")
+            commission_per_lot = st.number_input("Commission per Lot (per side)", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key="strat_commission")
+            
+            with st.expander("Execution Costs (Spread/Slippage)"):
+                spread_pips = st.number_input("Spread (pips)", min_value=0.0, max_value=1000.0, value=st.session_state.get('spread_pips', 0.0), step=0.1, key="strat_spread")
+                slippage_pips = st.number_input("Slippage (pips)", min_value=0.0, max_value=1000.0, value=st.session_state.get('slippage_pips', 0.0), step=0.1, key="strat_slippage")
+            
+            st.markdown("---")
+            
+            # Run button
+            run_backtest_clicked = st.button("Run Backtest", type="primary", use_container_width=True, key="run_backtest")
+        
+        with col_right:
+            # Apply session filter if needed
+            if session_mode == "Use mapped session":
+                if 'selected_days' in st.session_state:
+                    day_map = {'MON': 0, 'TUE': 1, 'WED': 2, 'THU': 3, 'FRI': 4, 'SAT': 5, 'SUN': 6}
+                    selected_day_nums = [day_map[d] for d in st.session_state['selected_days'] if d in day_map]
+                    df['day_of_week'] = df['time'].dt.dayofweek
+                    df = df[df['day_of_week'].isin(selected_day_nums)].copy()
+            
+            # Run backtest if button was clicked
+            if run_backtest_clicked:
+                
+                try:
+                    with st.spinner("Running backtest..."):
+                        # Add position size to entry params
+                        entry_params['position_size'] = position_size
+                        
+                        # Get instrument parameters for profit calculation
+                        symbol_name = st.session_state.get('data_symbol', 'DEFAULT')
+                        instrument_params = get_instrument_params(symbol_name)
+                        
+                        # Create strategy with direction mode
+                        strategy = ConfigurableStrategy(entry_type, exit_type, entry_params, exit_params, direction_mode)
+                        
+                        # Create and run backtest engine
+                        engine = BacktestEngine(
+                            df,
+                            strategy,
+                            initial_balance=10000,
+                            commission=commission_per_lot,
+                            instrument_params=instrument_params
+                        )
+                        
+                        # Run backtest
+                        results_df = engine.run()
+                        
+                        # Store results
+                        st.session_state['backtest_results'] = {
+                            'trades': results_df,
+                            'engine': engine,
+                            'data': df
+                        }
+                        
+                        st.success("✅ Backtest completed!")
+                
+                except Exception as e:
+                    st.error(f"Error running backtest: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+            
+            # Display results
+            if 'backtest_results' in st.session_state and st.session_state['backtest_results'] is not None:
+                results = st.session_state['backtest_results']
+                trades_df = results['trades']
+                engine = results['engine']
+                data_df = results['data']
+                
+                if len(trades_df) > 0:
+                    # Calculate metrics
+                    total_trades = len(trades_df)
+                    winning_trades = len(trades_df[trades_df['profit'] > 0])
+                    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+                    total_pnl = trades_df['profit'].sum()
+                    
+                    # Calculate cumulative equity
+                    trades_df = trades_df.copy()
+                    trades_df['cumulative_equity'] = 10000 + trades_df['profit'].cumsum()
+                    
+                    # Display metrics
+                    col_met1, col_met2, col_met3 = st.columns(3)
+                    with col_met1:
+                        st.metric("Total Trades", total_trades)
+                    with col_met2:
+                        st.metric("Win Rate", f"{win_rate:.1f}%")
+                    with col_met3:
+                        st.metric("Total P&L", f"${total_pnl:,.2f}")
+                    
+                    st.markdown("---")
+                    
+                    # View switcher
+                    view_mode = st.radio(
+                        "View:",
+                        ["Graph", "Table", "Distribution"],
+                        horizontal=True,
+                        key="strategy_view_mode"
+                    )
+                    
+                    st.markdown("---")
+                    
+                    if view_mode == "Graph":
+                        # Equity curve
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=trades_df.index,
+                            y=trades_df['cumulative_equity'],
+                            mode='lines',
+                            name='Equity Curve',
+                            line=dict(color='#26a69a', width=2)
+                        ))
+                        
+                        fig.update_layout(
+                            title="Equity Curve",
+                            xaxis_title="Trade Number",
+                            yaxis_title="Equity ($)",
+                            height=400,
+                            template="plotly_dark"
+                        )
+                        
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Price chart with trades (only in Graph view)
+                        fig_price = go.Figure()
+                        fig_price.add_trace(go.Candlestick(
+                            x=data_df['time'],
+                            open=data_df['open'],
+                            high=data_df['high'],
+                            low=data_df['low'],
+                            close=data_df['close'],
+                            name='Price'
+                        ))
+                        
+                        # Add trade markers on price chart
+                        for idx, trade in trades_df.iterrows():
+                            entry_time = trade['open_time']
+                            exit_time = trade['close_time']
+                            
+                            fig_price.add_trace(go.Scatter(
+                                x=[entry_time],
+                                y=[trade['open_price']],
+                                mode='markers',
+                                marker=dict(symbol='triangle-up', size=12, color='green', line=dict(width=2, color='white')),
+                                name="Entry",
+                                showlegend=False
+                            ))
+                            
+                            exit_color = 'red' if trade['profit'] < 0 else 'blue'
+                            fig_price.add_trace(go.Scatter(
+                                x=[exit_time],
+                                y=[trade['close_price']],
+                                mode='markers',
+                                marker=dict(symbol='triangle-down', size=12, color=exit_color, line=dict(width=2, color='white')),
+                                name="Exit",
+                                showlegend=False
+                            ))
+                        
+                        fig_price.update_layout(
+                            title="Price Chart with Trade Markers",
+                            xaxis_title="Time",
+                            yaxis_title="Price",
+                            height=500,
+                            template="plotly_dark",
+                            xaxis_rangeslider_visible=False
+                        )
+                        
+                        st.plotly_chart(fig_price, use_container_width=True)
+                    
+                    elif view_mode == "Table":
+                        # Prepare table data
+                        display_df = trades_df.copy()
+                        display_df['Entry Time'] = pd.to_datetime(display_df['open_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                        display_df['Exit Time'] = pd.to_datetime(display_df['close_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                        display_df['Direction'] = display_df['direction'].str.capitalize()
+                        display_df['Entry Price'] = display_df['open_price'].round(2)
+                        display_df['Exit Price'] = display_df['close_price'].round(2)
+                        display_df['P&L'] = display_df['profit'].round(2)
+                        display_df['Exit Reason'] = display_df['exit_reason']
+                        
+                        # Select columns to display
+                        table_cols = ['Entry Time', 'Exit Time', 'Direction', 'Entry Price', 'Exit Price', 'P&L', 'Exit Reason']
+                        display_df = display_df[table_cols]
+                        
+                        st.dataframe(display_df, use_container_width=True, height=600)
+                        
+                        # Show summary statistics below table
+                        st.markdown("---")
+                        col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
+                        with col_sum1:
+                            st.metric("Total Trades", total_trades)
+                        with col_sum2:
+                            st.metric("Winning Trades", winning_trades)
+                        with col_sum3:
+                            st.metric("Losing Trades", total_trades - winning_trades)
+                        with col_sum4:
+                            avg_profit = trades_df['profit'].mean()
+                            st.metric("Average P&L", f"${avg_profit:,.2f}")
+                    
+                    elif view_mode == "Distribution":
+                        # Prepare distribution data
+                        dist_df = trades_df.copy()
+                        dist_df['open_time'] = pd.to_datetime(dist_df['open_time'])
+                        dist_df['is_win'] = dist_df['profit'] > 0
+                        dist_df['direction_label'] = dist_df['direction'].str.capitalize()
+                        dist_df['day_of_week'] = dist_df['open_time'].dt.day_name()
+                        dist_df['hour'] = dist_df['open_time'].dt.hour
+                        
+                        # Create subplots
+                        fig_dist = make_subplots(
+                            rows=1, cols=3,
+                            subplot_titles=('By Buy/Sell', 'By Day of Week', 'By Trading Hour'),
+                            specs=[[{"type": "bar"}, {"type": "bar"}, {"type": "bar"}]]
+                        )
+                        
+                        # 1. Distribution by Buy/Sell
+                        buy_sell_counts = dist_df.groupby(['direction_label', 'is_win']).size().reset_index(name='count')
+                        
+                        directions = ['Long', 'Short']
+                        x_buysell = []
+                        y_win = []
+                        y_loss = []
+                        
+                        for direction in directions:
+                            win_count = buy_sell_counts[
+                                (buy_sell_counts['direction_label'] == direction) & 
+                                (buy_sell_counts['is_win'] == True)
+                            ]['count'].sum()
+                            loss_count = buy_sell_counts[
+                                (buy_sell_counts['direction_label'] == direction) & 
+                                (buy_sell_counts['is_win'] == False)
+                            ]['count'].sum()
+                            
+                            x_buysell.append(direction)
+                            y_win.append(win_count)
+                            y_loss.append(loss_count)
+                        
+                        fig_dist.add_trace(
+                            go.Bar(x=x_buysell, y=y_win, name='Win', marker_color='green', showlegend=True),
+                            row=1, col=1
+                        )
+                        fig_dist.add_trace(
+                            go.Bar(x=x_buysell, y=y_loss, name='Loss', marker_color='red', showlegend=True),
+                            row=1, col=1
+                        )
+                        
+                        # 2. Distribution by Day of Week
+                        day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                        day_counts = dist_df.groupby(['day_of_week', 'is_win']).size().reset_index(name='count')
+                        
+                        x_days = []
+                        y_win_days = []
+                        y_loss_days = []
+                        
+                        for day in day_order:
+                            win_count = day_counts[
+                                (day_counts['day_of_week'] == day) & (day_counts['is_win'] == True)
+                            ]['count'].sum()
+                            loss_count = day_counts[
+                                (day_counts['day_of_week'] == day) & (day_counts['is_win'] == False)
+                            ]['count'].sum()
+                            
+                            if win_count > 0 or loss_count > 0:
+                                x_days.append(day[:3])
+                                y_win_days.append(win_count)
+                                y_loss_days.append(loss_count)
+                        
+                        if x_days:
+                            fig_dist.add_trace(
+                                go.Bar(x=x_days, y=y_win_days, name='Win', marker_color='green', showlegend=False),
+                                row=1, col=2
+                            )
+                            fig_dist.add_trace(
+                                go.Bar(x=x_days, y=y_loss_days, name='Loss', marker_color='red', showlegend=False),
+                                row=1, col=2
+                            )
+                        
+                        # 3. Distribution by Trading Hour
+                        hour_counts = dist_df.groupby(['hour', 'is_win']).size().reset_index(name='count')
+                        
+                        x_hours = []
+                        y_win_hours = []
+                        y_loss_hours = []
+                        
+                        for hour in range(24):
+                            win_count = hour_counts[
+                                (hour_counts['hour'] == hour) & (hour_counts['is_win'] == True)
+                            ]['count'].sum()
+                            loss_count = hour_counts[
+                                (hour_counts['hour'] == hour) & (hour_counts['is_win'] == False)
+                            ]['count'].sum()
+                            
+                            if win_count > 0 or loss_count > 0:
+                                x_hours.append(f"{hour:02d}:00")
+                                y_win_hours.append(win_count)
+                                y_loss_hours.append(loss_count)
+                        
+                        if x_hours:
+                            fig_dist.add_trace(
+                                go.Bar(x=x_hours, y=y_win_hours, name='Win', marker_color='green', showlegend=False),
+                                row=1, col=3
+                            )
+                            fig_dist.add_trace(
+                                go.Bar(x=x_hours, y=y_loss_hours, name='Loss', marker_color='red', showlegend=False),
+                                row=1, col=3
+                            )
+                        
+                        fig_dist.update_layout(
+                            height=500,
+                            template="plotly_dark",
+                            barmode='group',
+                            showlegend=True
+                        )
+                        
+                        fig_dist.update_xaxes(title_text="", row=1, col=1)
+                        fig_dist.update_xaxes(title_text="Day", row=1, col=2)
+                        fig_dist.update_xaxes(title_text="Hour", row=1, col=3)
+                        fig_dist.update_yaxes(title_text="Number of Trades", row=1, col=1)
+                        fig_dist.update_yaxes(title_text="Number of Trades", row=1, col=2)
+                        fig_dist.update_yaxes(title_text="Number of Trades", row=1, col=3)
+                        
+                        st.plotly_chart(fig_dist, use_container_width=True)
+                
+                else:
+                    st.warning("No trades generated by the strategy")
+            else:
+                st.info("Configure strategy and click 'Run Backtest' to see results")
