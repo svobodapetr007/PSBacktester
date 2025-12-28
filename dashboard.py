@@ -4,7 +4,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
+import yfinance as yf
 from backtester import BacktestEngine
 from strategy import MyPerfectStrategy
 from data_utils import (
@@ -97,7 +98,7 @@ if st.session_state['current_tab'] == 'Data':
         # Data source selection
         data_source = st.radio(
             "Choose data source:",
-            ["MT5 (MetaTrader5)", "CSV Upload", "Simulation Data"],
+            ["MT5 (MetaTrader5)", "CSV Upload", "Yahoo Finance"],
             index=2 if not MT5_ENABLED else 0,
             label_visibility="collapsed"
         )
@@ -218,30 +219,63 @@ if st.session_state['current_tab'] == 'Data':
                 st.info(f"📊 Loaded: {len(df)} bars")
         
         # --- SIMULATION DATA ---
+        # --- YAHOO FINANCE ---
         else:
-            st.subheader("Simulation Data")
-            st.info("Generate synthetic data for testing")
-            rows = st.slider("Data Points", 100, 5000, 1000)
-            volatility = st.slider("Volatility", 0.001, 0.010, 0.005, step=0.001)
+            st.subheader("Yahoo Finance Data")
+            st.info("Fetch market data from Yahoo Finance")
             
-            if st.button("Generate Data", use_container_width=True):
+            col_yf_sym, col_yf_int = st.columns([2, 1])
+            with col_yf_sym:
+                yf_symbol = st.text_input("Symbol", value="SPY", help="e.g. SPY, AAPL, BTC-USD")
+            with col_yf_int:
+                yf_interval = st.selectbox(
+                    "Interval",
+                    options=["1d", "1h", "15m", "5m", "1m"],
+                    index=1
+                )
+            
+            col_yf_start, col_yf_end = st.columns(2)
+            with col_yf_start:
+                yf_start_date = st.date_input("Start Date", value=datetime.now() - timedelta(days=365), key="yf_start")
+            with col_yf_end:
+                yf_end_date = st.date_input("End Date", value=datetime.now(), key="yf_end")
+            
+            if st.button("Fetch YF Data", use_container_width=True):
                 try:
-                    dates = pd.date_range(start='2023-01-01', periods=rows, freq='H')
-                    price_walk = 1.10 + np.cumsum(np.random.normal(0, volatility, rows))
-                    df_raw = pd.DataFrame({
-                        'time': dates,
-                        'open': price_walk,
-                        'high': price_walk + volatility/2,
-                        'low': price_walk - volatility/2,
-                        'close': price_walk + np.random.normal(0, volatility/10, rows)
-                    })
-                    # Normalize all data sources for consistency
-                    df = normalize_csv_data(df_raw)
-                    st.session_state['data'] = df
-                    st.session_state['data_symbol'] = "SIMULATION"
-                    st.success(f"✅ Generated {len(df)} bars")
+                    with st.spinner(f"Fetching {yf_symbol} data..."):
+                        # Fetch data
+                        df_raw = yf.download(
+                            tickers=yf_symbol,
+                            start=yf_start_date,
+                            end=yf_end_date + timedelta(days=1),
+                            interval=yf_interval,
+                            progress=False
+                        )
+                        
+                        if df_raw.empty:
+                            st.error(f"No data found for {yf_symbol}")
+                        else:
+                            # Handle MultiIndex columns if present (yfinance 0.2+)
+                            if isinstance(df_raw.columns, pd.MultiIndex):
+                                # If we have a MultiIndex with (Price, Ticker), we just want the Price part
+                                # But if multiple tickers were downloaded it might be different. 
+                                # Here we only download one ticker.
+                                try:
+                                    df_raw.columns = df_raw.columns.get_level_values(0)
+                                except:
+                                    pass
+                            
+                            # Reset index to get Date/Datetime as column
+                            df_raw = df_raw.reset_index()
+                            
+                            # Normalize all data sources for consistency
+                            df = normalize_csv_data(df_raw)
+                            st.session_state['data'] = df
+                            st.session_state['data_symbol'] = yf_symbol
+                            st.session_state['data_timeframe'] = yf_interval
+                            st.success(f"✅ Fetched {len(df)} bars")
                 except Exception as e:
-                    st.error(f"Error generating data: {str(e)}")
+                    st.error(f"Error fetching data: {str(e)}")
             
             if 'data' in st.session_state and not st.session_state['data'].empty:
                 df = st.session_state['data']
@@ -269,30 +303,43 @@ if st.session_state['current_tab'] == 'Data':
                     subplot_titles=(f"{symbol_name} - OHLC Chart", None)
                 )
                 
-                # Add candlestick to first subplot
+                # Add candlestick to first subplot - optimize for performance by downsampling
+                # Downsample data if too large for better performance
+                display_df = df.copy()
+                if len(display_df) > 5000:
+                    # Downsample to max 5000 points while preserving OHLC structure
+                    step = len(display_df) // 5000
+                    display_df = display_df.iloc[::step].copy()
+                
                 fig.add_trace(
                     go.Candlestick(
-                        x=df['time'],
-                        open=df['open'],
-                        high=df['high'],
-                        low=df['low'],
-                        close=df['close'],
-                        name="Price"
+                        x=display_df['time'],
+                        open=display_df['open'],
+                        high=display_df['high'],
+                        low=display_df['low'],
+                        close=display_df['close'],
+                        name="Price",
+                        increasing_line_color='#26a69a',
+                        decreasing_line_color='#ef5350'
                     ),
                     row=1, col=1
                 )
                 
                 # Add volume bars to second subplot matching OHLC candle colors (vectorized)
-                colors = np.where(df['close'] < df['open'], '#ef5350', '#26a69a')
+                # Use Scattergl for better performance with large datasets
+                # Use same downsampled data for volume to keep alignment
+                colors = np.where(display_df['close'] < display_df['open'], '#ef5350', '#26a69a')
                 fig.add_trace(
-                    go.Bar(
-                        x=df['time'],
-                        y=df['volume'],
+                    go.Scattergl(
+                        x=display_df['time'],
+                        y=display_df['volume'],
+                        mode='markers',
                         name="Volume",
                         marker=dict(
                             color=colors,
-                            line=dict(width=0),
-                            opacity=1.0  # Full opacity
+                            size=3,
+                            opacity=0.8,
+                            line=dict(width=0)
                         ),
                         showlegend=False
                     ),
@@ -303,21 +350,33 @@ if st.session_state['current_tab'] == 'Data':
                     height=700,
                     template="plotly_dark",
                     xaxis_rangeslider_visible=False,
-                    showlegend=False
+                    showlegend=False,
+                    uirevision='ohlc_chart',  # Prevents unnecessary redraws
+                    hovermode='x unified',  # More efficient hover
+                    dragmode='pan'  # Default to pan for better performance
                 )
                 
                 fig.update_xaxes(title_text="Time", row=2, col=1)
                 fig.update_yaxes(title_text="Price", row=1, col=1)
                 fig.update_yaxes(title_text="Volume", row=2, col=1, showgrid=False)
             else:
-                # Single chart without volume
+                # Single chart without volume - optimize for performance by downsampling
+                # Downsample data if too large for better performance
+                display_df = df.copy()
+                if len(display_df) > 5000:
+                    # Downsample to max 5000 points while preserving OHLC structure
+                    step = len(display_df) // 5000
+                    display_df = display_df.iloc[::step].copy()
+                
                 fig = go.Figure(data=[go.Candlestick(
-                    x=df['time'],
-                    open=df['open'],
-                    high=df['high'],
-                    low=df['low'],
-                    close=df['close'],
-                    name='OHLC'
+                    x=display_df['time'],
+                    open=display_df['open'],
+                    high=display_df['high'],
+                    low=display_df['low'],
+                    close=display_df['close'],
+                    name='OHLC',
+                    increasing_line_color='#26a69a',
+                    decreasing_line_color='#ef5350'
                 )])
                 
                 fig.update_layout(
@@ -326,7 +385,10 @@ if st.session_state['current_tab'] == 'Data':
                     yaxis_title="Price",
                     height=600,
                     xaxis_rangeslider_visible=False,
-                    template="plotly_dark"
+                    template="plotly_dark",
+                    uirevision='ohlc_single',  # Prevents unnecessary redraws
+                    hovermode='x unified',  # More efficient hover
+                    dragmode='pan'  # Default to pan for better performance
                 )
             
             st.plotly_chart(fig, use_container_width=True)
@@ -530,10 +592,10 @@ elif st.session_state['current_tab'] == 'Market Mapper':
                 
                 # Display based on view mode
                 if view_mode == "Chart":
-                    # Create equity curve chart
+                    # Create equity curve chart - use Scattergl for performance
                     fig = go.Figure()
                     
-                    fig.add_trace(go.Scatter(
+                    fig.add_trace(go.Scattergl(
                         x=range_filtered['trade_number'],
                         y=range_filtered['cumulative_equity'],
                         mode='lines',
@@ -554,7 +616,9 @@ elif st.session_state['current_tab'] == 'Market Mapper':
                         yaxis_title="Cumulative Equity ($)",
                         height=600,
                         template="plotly_dark",
-                        hovermode='x unified'
+                        hovermode='x unified',
+                        uirevision='market_mapper_equity',  # Prevents unnecessary redraws
+                        dragmode='pan'  # Default to pan for better performance
                     )
                     
                     st.plotly_chart(fig, use_container_width=True)
@@ -640,6 +704,12 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                 key="entry_strategy"
             )
             
+            # Track previous entry strategy to detect changes
+            prev_entry_strategy = st.session_state.get('prev_entry_strategy', None)
+            entry_strategy_changed = (prev_entry_strategy != entry_type)
+            if entry_strategy_changed:
+                st.session_state['prev_entry_strategy'] = entry_type
+            
             entry_params = {}
             
             if entry_type == "SMA Crossover":
@@ -652,13 +722,20 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
             elif entry_type == "RSI Threshold":
                 entry_mode = st.radio("Mode", ["Mean Reversion", "Momentum"], key="rsi_mode")
                 entry_params['mode'] = entry_mode.lower().replace(' ', '_')
-                col_len, col_os, col_ob = st.columns(3)
+                col_len = st.columns(1)[0]
                 with col_len:
                     entry_params['length'] = st.number_input("RSI Length", min_value=2, max_value=50, value=14, step=1, key="rsi_length")
-                with col_os:
-                    entry_params['oversold'] = st.number_input("Oversold", min_value=0, max_value=50, value=30, step=1, key="rsi_oversold")
-                with col_ob:
-                    entry_params['overbought'] = st.number_input("Overbought", min_value=50, max_value=100, value=70, step=1, key="rsi_overbought")
+                
+                if entry_mode == "Mean Reversion":
+                    col_os, col_ob = st.columns(2)
+                    with col_os:
+                        entry_params['oversold'] = st.number_input("Oversold", min_value=0, max_value=50, value=30, step=1, key="rsi_oversold")
+                    with col_ob:
+                        entry_params['overbought'] = st.number_input("Overbought", min_value=50, max_value=100, value=70, step=1, key="rsi_overbought")
+                else:  # Momentum
+                    col_cross = st.columns(1)[0]
+                    with col_cross:
+                        entry_params['crossing_threshold'] = st.number_input("RSI Crossing", min_value=0, max_value=100, value=50, step=1, key="rsi_crossing")
             
             elif entry_type == "MACD Cross":
                 col_fast, col_slow, col_sig = st.columns(3)
@@ -675,17 +752,21 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
             
             # Exit Strategy
             st.write("**Exit Strategy**")
-            exit_options = ["Fixed TP/SL (ATR)", "ATR Trailing Stop", "SMA Cross Back"]
+            exit_options = ["Fixed TP/SL (ATR)", "ATR Trailing Stop", "SMA Cross Back", "Time based"]
             
-            # Auto-select SMA Cross Back exit when SMA entry is selected
-            if entry_type == "SMA Crossover":
-                if 'exit_strategy' not in st.session_state or st.session_state.get('exit_strategy') != "SMA Cross Back":
+            # Auto-select exit strategy only when entry strategy changes
+            if entry_strategy_changed:
+                if entry_type == "SMA Crossover":
                     st.session_state['exit_strategy'] = "SMA Cross Back"
-                default_exit_index = 2  # SMA Cross Back
-            else:
-                # Keep current selection if it exists, otherwise default to first option
-                current_exit = st.session_state.get('exit_strategy', exit_options[0])
-                default_exit_index = exit_options.index(current_exit) if current_exit in exit_options else 0
+                elif entry_type == "RSI Threshold":
+                    # Check if RSI mode is Momentum (only auto-select if we can determine it)
+                    rsi_mode = st.session_state.get('rsi_mode', 'Mean Reversion')
+                    if rsi_mode == "Momentum":
+                        st.session_state['exit_strategy'] = "Time based"
+            
+            # Get current exit selection
+            current_exit = st.session_state.get('exit_strategy', exit_options[0])
+            default_exit_index = exit_options.index(current_exit) if current_exit in exit_options else 0
             
             exit_type = st.selectbox(
                 "Exit",
@@ -714,6 +795,15 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
             
             elif exit_type == "SMA Cross Back":
                 st.info("Uses reverse of entry strategy (e.g., SMA cross back for SMA entry)")
+            
+            elif exit_type == "Time based":
+                exit_time_mode = st.selectbox(
+                    "Time Mode",
+                    ["EOD"],
+                    key="exit_time_mode"
+                )
+                exit_params['time_mode'] = exit_time_mode.lower()
+                st.info("Closes all positions at the end of each trading day")
             
             st.markdown("---")
             
@@ -821,9 +911,9 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                     st.markdown("---")
                     
                     if view_mode == "Graph":
-                        # Equity curve
+                        # Equity curve - use Scattergl for performance
                         fig = go.Figure()
-                        fig.add_trace(go.Scatter(
+                        fig.add_trace(go.Scattergl(
                             x=trades_df.index,
                             y=trades_df['cumulative_equity'],
                             mode='lines',
@@ -836,44 +926,74 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                             xaxis_title="Trade Number",
                             yaxis_title="Equity ($)",
                             height=400,
-                            template="plotly_dark"
+                            template="plotly_dark",
+                            uirevision='equity_curve'  # Prevents unnecessary redraws
                         )
                         
                         st.plotly_chart(fig, use_container_width=True)
                         
                         # Price chart with trades (only in Graph view)
+                        # Optimize candlestick for large datasets by downsampling
                         fig_price = go.Figure()
+                        # Downsample data if too large for better performance
+                        display_df = data_df.copy()
+                        if len(display_df) > 5000:
+                            # Downsample to max 5000 points while preserving OHLC structure
+                            step = len(display_df) // 5000
+                            display_df = display_df.iloc[::step].copy()
+                        
                         fig_price.add_trace(go.Candlestick(
-                            x=data_df['time'],
-                            open=data_df['open'],
-                            high=data_df['high'],
-                            low=data_df['low'],
-                            close=data_df['close'],
-                            name='Price'
+                            x=display_df['time'],
+                            open=display_df['open'],
+                            high=display_df['high'],
+                            low=display_df['low'],
+                            close=display_df['close'],
+                            name='Price',
+                            increasing_line_color='#26a69a',
+                            decreasing_line_color='#ef5350'
                         ))
                         
-                        # Add trade markers on price chart
-                        for idx, trade in trades_df.iterrows():
-                            entry_time = trade['open_time']
-                            exit_time = trade['close_time']
+                        # Add trade markers on price chart using Scattergl for WebGL performance
+                        if len(trades_df) > 0:
+                            # Collect all entry points
+                            entry_times = trades_df['open_time'].tolist()
+                            entry_prices = trades_df['open_price'].tolist()
                             
-                            fig_price.add_trace(go.Scatter(
-                                x=[entry_time],
-                                y=[trade['open_price']],
+                            # Collect all exit points with colors
+                            exit_times = trades_df['close_time'].tolist()
+                            exit_prices = trades_df['close_price'].tolist()
+                            exit_colors = ['red' if profit < 0 else 'blue' for profit in trades_df['profit'].tolist()]
+                            
+                            # Add entry markers as single Scattergl trace
+                            fig_price.add_trace(go.Scattergl(
+                                x=entry_times,
+                                y=entry_prices,
                                 mode='markers',
-                                marker=dict(symbol='triangle-up', size=12, color='green', line=dict(width=2, color='white')),
+                                marker=dict(
+                                    symbol='triangle-up',
+                                    size=12,
+                                    color='green',
+                                    line=dict(width=2, color='white')
+                                ),
                                 name="Entry",
-                                showlegend=False
+                                showlegend=True,
+                                legendgroup="trades"
                             ))
                             
-                            exit_color = 'red' if trade['profit'] < 0 else 'blue'
-                            fig_price.add_trace(go.Scatter(
-                                x=[exit_time],
-                                y=[trade['close_price']],
+                            # Add exit markers as single Scattergl trace with individual colors
+                            fig_price.add_trace(go.Scattergl(
+                                x=exit_times,
+                                y=exit_prices,
                                 mode='markers',
-                                marker=dict(symbol='triangle-down', size=12, color=exit_color, line=dict(width=2, color='white')),
+                                marker=dict(
+                                    symbol='triangle-down',
+                                    size=12,
+                                    color=exit_colors,
+                                    line=dict(width=2, color='white')
+                                ),
                                 name="Exit",
-                                showlegend=False
+                                showlegend=True,
+                                legendgroup="trades"
                             ))
                         
                         fig_price.update_layout(
@@ -882,7 +1002,15 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                             yaxis_title="Price",
                             height=500,
                             template="plotly_dark",
-                            xaxis_rangeslider_visible=False
+                            xaxis_rangeslider_visible=False,
+                            uirevision='price_chart',  # Prevents unnecessary redraws
+                            hovermode='x unified',  # More efficient hover
+                            dragmode='pan'  # Default to pan for better performance
+                        )
+                        # Optimize x-axis for performance
+                        fig_price.update_xaxes(
+                            rangeslider_visible=False,
+                            type='date'
                         )
                         
                         st.plotly_chart(fig_price, use_container_width=True)

@@ -152,11 +152,11 @@ class ConfigurableStrategy(Strategy):
         
         elif self.entry_type == 'RSI Threshold':
             rsi = self.data['rsi'].iloc[i]
-            oversold = self.entry_params.get('oversold', 30)
-            overbought = self.entry_params.get('overbought', 70)
             mode = self.entry_params.get('mode', 'mean_reversion')  # 'mean_reversion' or 'momentum'
             
             if mode == 'mean_reversion':
+                oversold = self.entry_params.get('oversold', 30)
+                overbought = self.entry_params.get('overbought', 70)
                 if rsi < oversold and self.direction_mode in ["Long", "Both"]:
                     sl, tp = self._get_sl_tp(i, price, 'long')
                     self.current_trade_direction = 'long'
@@ -168,13 +168,14 @@ class ConfigurableStrategy(Strategy):
                     self.trailing_stop_price = None
                     self.sell(volume=self.entry_params.get('position_size', 1.0), sl=sl, tp=tp)
             else:  # momentum
+                crossing_threshold = self.entry_params.get('crossing_threshold', 50)
                 rsi_prev = self.data['rsi'].iloc[i-1] if i > 0 else rsi
-                if rsi > 50 and rsi_prev <= 50 and self.direction_mode in ["Long", "Both"]:
+                if rsi > crossing_threshold and rsi_prev <= crossing_threshold and self.direction_mode in ["Long", "Both"]:
                     sl, tp = self._get_sl_tp(i, price, 'long')
                     self.current_trade_direction = 'long'
                     self.trailing_stop_price = None
                     self.buy(volume=self.entry_params.get('position_size', 1.0), sl=sl, tp=tp)
-                elif rsi < 50 and rsi_prev >= 50 and self.direction_mode in ["Short", "Both"]:
+                elif rsi < crossing_threshold and rsi_prev >= crossing_threshold and self.direction_mode in ["Short", "Both"]:
                     sl, tp = self._get_sl_tp(i, price, 'short')
                     self.current_trade_direction = 'short'
                     self.trailing_stop_price = None
@@ -269,6 +270,27 @@ class ConfigurableStrategy(Strategy):
                 # Reverse crossover: fast crosses below slow
                 if fast < slow and fast_prev >= slow_prev:
                     self.close_all()
+                    self.trailing_stop_price = None
+                    self.current_trade_direction = None
+        
+        elif self.exit_type == 'Time based':
+            time_mode = self.exit_params.get('time_mode', 'eod')
+            if time_mode == 'eod':
+                # Check if this is the last bar of the day
+                current_time = self.data['time'].iloc[i]
+                current_date = current_time.date()
+                
+                # Check if next bar exists and is on a different day
+                is_last_bar = (i == len(self.data) - 1)  # Last bar of dataset
+                if not is_last_bar:
+                    next_time = self.data['time'].iloc[i + 1]
+                    next_date = next_time.date()
+                    is_last_bar = (current_date != next_date)
+                
+                if is_last_bar:
+                    self.close_all()
+                    self.trailing_stop_price = None
+                    self.current_trade_direction = None
             
             elif self.entry_type == 'MACD Cross':
                 macd = self.data['macd'].iloc[i]
