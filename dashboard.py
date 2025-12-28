@@ -13,6 +13,8 @@ from data_utils import (
     generate_trades_dt, generate_trades_swing
 )
 from strategy_builder import ConfigurableStrategy
+from vectorbt_engine import run_vectorbt_backtest
+import vectorbt as vbt
 
 # Try to import MT5 utils (will work if ENABLE_MT5 = True)
 try:
@@ -750,29 +752,40 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
             
             st.markdown("---")
             
-            # Exit Strategy
+            # Exit Strategy - dynamically filtered based on entry
             st.write("**Exit Strategy**")
-            exit_options = ["Fixed TP/SL (ATR)", "ATR Trailing Stop", "SMA Cross Back", "Time based"]
+            
+            # Define which exit strategies are compatible with each entry strategy
+            exit_compatibility = {
+                "SMA Crossover": ["SMA Cross Back", "Fixed TP/SL (ATR)", "ATR Trailing Stop", "Time based"],
+                "RSI Threshold": ["Fixed TP/SL (ATR)", "ATR Trailing Stop", "Time based"],
+                "MACD Cross": ["Fixed TP/SL (ATR)", "ATR Trailing Stop", "Time based"]
+            }
+            
+            # Get available exit options for current entry
+            available_exit_options = exit_compatibility.get(entry_type, ["Fixed TP/SL (ATR)", "ATR Trailing Stop", "Time based"])
             
             # Auto-select exit strategy only when entry strategy changes
             if entry_strategy_changed:
                 if entry_type == "SMA Crossover":
                     st.session_state['exit_strategy'] = "SMA Cross Back"
-                elif entry_type == "RSI Threshold":
-                    # Check if RSI mode is Momentum (only auto-select if we can determine it)
-                    rsi_mode = st.session_state.get('rsi_mode', 'Mean Reversion')
-                    if rsi_mode == "Momentum":
-                        st.session_state['exit_strategy'] = "Time based"
+                else:
+                    st.session_state['exit_strategy'] = "Fixed TP/SL (ATR)"
             
-            # Get current exit selection
-            current_exit = st.session_state.get('exit_strategy', exit_options[0])
-            default_exit_index = exit_options.index(current_exit) if current_exit in exit_options else 0
+            # Get current exit selection, ensure it's in available options
+            current_exit = st.session_state.get('exit_strategy', available_exit_options[0])
+            if current_exit not in available_exit_options:
+                current_exit = available_exit_options[0]
+                st.session_state['exit_strategy'] = current_exit
+            
+            default_exit_index = available_exit_options.index(current_exit)
             
             exit_type = st.selectbox(
                 "Exit",
-                exit_options,
+                available_exit_options,
                 key="exit_strategy",
-                index=default_exit_index
+                index=default_exit_index,
+                help="Available exit strategies depend on your entry strategy"
             )
             
             exit_params = {}
@@ -794,7 +807,10 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                     exit_params['atr_multiplier'] = st.number_input("ATR Multiplier", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="atr_mult")
             
             elif exit_type == "SMA Cross Back":
-                st.info("Uses reverse of entry strategy (e.g., SMA cross back for SMA entry)")
+                if entry_type == "SMA Crossover":
+                    st.info("✓ Exits when fast SMA crosses back below/above slow SMA (opposite of entry)")
+                else:
+                    st.warning("⚠️ SMA Cross Back only works with SMA Crossover entry")
             
             elif exit_type == "Time based":
                 exit_time_mode = st.selectbox(
@@ -809,6 +825,18 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
             
             # Position and Costs
             st.write("**Position & Costs**")
+            
+            # Starting balance
+            initial_balance = st.number_input(
+                "Starting Balance ($)", 
+                min_value=100.0, 
+                max_value=1000000.0, 
+                value=10000.0, 
+                step=100.0, 
+                key="initial_balance",
+                help="Initial account balance for backtesting"
+            )
+            
             position_size = st.number_input("Position Size (Lots)", min_value=0.01, max_value=100.0, value=1.0, step=0.01, key="strat_pos_size")
             commission_per_lot = st.number_input("Commission per Lot (per side)", min_value=0.0, max_value=100.0, value=0.0, step=0.1, key="strat_commission")
             
@@ -834,37 +862,32 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
             if run_backtest_clicked:
                 
                 try:
-                    with st.spinner("Running backtest..."):
+                    with st.spinner("Running backtest with VectorBT..."):
                         # Add position size to entry params
                         entry_params['position_size'] = position_size
                         
-                        # Get instrument parameters for profit calculation
-                        symbol_name = st.session_state.get('data_symbol', 'DEFAULT')
-                        instrument_params = get_instrument_params(symbol_name)
-                        
-                        # Create strategy with direction mode
-                        strategy = ConfigurableStrategy(entry_type, exit_type, entry_params, exit_params, direction_mode)
-                        
-                        # Create and run backtest engine
-                        engine = BacktestEngine(
+                        # Run vectorbt backtest
+                        portfolio, indicators = run_vectorbt_backtest(
                             df,
-                            strategy,
-                            initial_balance=10000,
-                            commission=commission_per_lot,
-                            instrument_params=instrument_params
+                            entry_type,
+                            exit_type,
+                            entry_params,
+                            exit_params,
+                            direction_mode,
+                            initial_cash=initial_balance,
+                            commission=commission_per_lot / 10000  # Convert to fraction
                         )
-                        
-                        # Run backtest
-                        results_df = engine.run()
                         
                         # Store results
                         st.session_state['backtest_results'] = {
-                            'trades': results_df,
-                            'engine': engine,
-                            'data': df
+                            'portfolio': portfolio,
+                            'indicators': indicators,
+                            'data': df,
+                            'entry_type': entry_type,
+                            'exit_type': exit_type
                         }
                         
-                        st.success("✅ Backtest completed!")
+                        st.success("✅ Backtest completed with VectorBT!")
                 
                 except Exception as e:
                     st.error(f"Error running backtest: {str(e)}")
@@ -874,76 +897,135 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
             # Display results
             if 'backtest_results' in st.session_state and st.session_state['backtest_results'] is not None:
                 results = st.session_state['backtest_results']
-                trades_df = results['trades']
-                engine = results['engine']
-                data_df = results['data']
+                portfolio = results['portfolio']
+                indicators = results['indicators']
+                data_df = results['data'].copy()
+                entry_type = results.get('entry_type', '')
+                exit_type = results.get('exit_type', '')
                 
-                if len(trades_df) > 0:
-                    # Calculate metrics
-                    total_trades = len(trades_df)
-                    winning_trades = len(trades_df[trades_df['profit'] > 0])
-                    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-                    total_pnl = trades_df['profit'].sum()
+                # Get portfolio stats
+                stats = portfolio.stats()
+                
+                # Display key metrics
+                col_met1, col_met2, col_met3, col_met4, col_met5 = st.columns(5)
+                with col_met1:
+                    st.metric("Total Trades", int(stats['Total Trades']))
+                with col_met2:
+                    st.metric("Win Rate", f"{stats['Win Rate [%]']:.1f}%")
+                with col_met3:
+                    st.metric("Total Return", f"{stats['Total Return [%]']:.2f}%")
+                with col_met4:
+                    st.metric("Max Drawdown", f"{stats['Max Drawdown [%]']:.2f}%")
+                with col_met5:
+                    st.metric("Sharpe Ratio", f"{stats.get('Sharpe Ratio', 0):.2f}")
+                
+                st.markdown("---")
+                
+                # View switcher
+                view_mode = st.radio(
+                    "View:",
+                    ["Equity Curve", "Price Chart with Indicators", "Trades Table", "Analytics", "Stats"],
+                    horizontal=True,
+                    key="strategy_view_mode"
+                )
+                
+                st.markdown("---")
+                
+                if view_mode == "Equity Curve":
+                    # Use vectorbt's built-in plotting
+                    st.subheader("Portfolio Value Over Time")
                     
-                    # Calculate cumulative equity
-                    trades_df = trades_df.copy()
-                    trades_df['cumulative_equity'] = 10000 + trades_df['profit'].cumsum()
+                    # Get equity data
+                    equity = portfolio.value()
                     
-                    # Display metrics
-                    col_met1, col_met2, col_met3 = st.columns(3)
-                    with col_met1:
-                        st.metric("Total Trades", total_trades)
-                    with col_met2:
-                        st.metric("Win Rate", f"{win_rate:.1f}%")
-                    with col_met3:
-                        st.metric("Total P&L", f"${total_pnl:,.2f}")
+                    # Create plotly figure
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=equity.index,
+                        y=equity.values,
+                        mode='lines',
+                        name='Portfolio Value',
+                        line=dict(color='#26a69a', width=2),
+                        fill='tozeroy',
+                        fillcolor='rgba(38, 166, 154, 0.1)'
+                    ))
                     
-                    st.markdown("---")
-                    
-                    # View switcher
-                    view_mode = st.radio(
-                        "View:",
-                        ["Graph", "Table", "Distribution"],
-                        horizontal=True,
-                        key="strategy_view_mode"
+                    fig.update_layout(
+                        title="Portfolio Equity Curve",
+                        xaxis_title="Time",
+                        yaxis_title="Portfolio Value ($)",
+                        height=500,
+                        template="plotly_dark",
+                        hovermode='x unified'
                     )
                     
-                    st.markdown("---")
+                    st.plotly_chart(fig, use_container_width=True)
                     
-                    if view_mode == "Graph":
-                        # Equity curve - use Scattergl for performance
-                        fig = go.Figure()
-                        fig.add_trace(go.Scattergl(
-                            x=trades_df.index,
-                            y=trades_df['cumulative_equity'],
-                            mode='lines',
-                            name='Equity Curve',
-                            line=dict(color='#26a69a', width=2)
-                        ))
-                        
-                        fig.update_layout(
-                            title="Equity Curve",
-                            xaxis_title="Trade Number",
-                            yaxis_title="Equity ($)",
-                            height=400,
-                            template="plotly_dark",
-                            uirevision='equity_curve'  # Prevents unnecessary redraws
-                        )
-                        
-                        st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Price chart with trades (only in Graph view)
-                        # Optimize candlestick for large datasets by downsampling
-                        fig_price = go.Figure()
-                        # Downsample data if too large for better performance
-                        display_df = data_df.copy()
-                        if len(display_df) > 5000:
-                            # Downsample to max 5000 points while preserving OHLC structure
-                            step = len(display_df) // 5000
-                            display_df = display_df.iloc[::step].copy()
-                        
-                        fig_price.add_trace(go.Candlestick(
-                            x=display_df['time'],
+                    # Drawdown chart
+                    st.subheader("Drawdown")
+                    drawdowns = portfolio.drawdown() * 100  # Convert to percentage
+                    
+                    fig_dd = go.Figure()
+                    fig_dd.add_trace(go.Scatter(
+                        x=drawdowns.index,
+                        y=drawdowns.values,
+                        mode='lines',
+                        name='Drawdown',
+                        line=dict(color='#ef5350', width=2),
+                        fill='tozeroy',
+                        fillcolor='rgba(239, 83, 80, 0.1)'
+                    ))
+                    
+                    fig_dd.update_layout(
+                        title="Drawdown Over Time",
+                        xaxis_title="Time",
+                        yaxis_title="Drawdown (%)",
+                        height=300,
+                        template="plotly_dark",
+                        hovermode='x unified'
+                    )
+                    
+                    st.plotly_chart(fig_dd, use_container_width=True)
+                
+                elif view_mode == "Price Chart with Indicators":
+                    st.subheader(f"Price Chart with {entry_type} Signals")
+                    
+                    # Set time index for data_df (vectorbt uses time index)
+                    data_df_indexed = data_df.set_index('time')
+                    
+                    # Create subplots based on indicators
+                    num_subplots = 1
+                    subplot_titles = ["Price"]
+                    
+                    # Determine if we need additional subplots
+                    if 'rsi' in indicators:
+                        num_subplots += 1
+                        subplot_titles.append("RSI")
+                    if 'macd' in indicators:
+                        num_subplots += 1
+                        subplot_titles.append("MACD")
+                    
+                    # Create figure with subplots
+                    row_heights = [0.6] + [0.2] * (num_subplots - 1)
+                    fig = make_subplots(
+                        rows=num_subplots,
+                        cols=1,
+                        shared_xaxes=True,
+                        vertical_spacing=0.03,
+                        row_heights=row_heights,
+                        subplot_titles=subplot_titles
+                    )
+                    
+                    # Downsample if needed
+                    display_df = data_df_indexed.copy()
+                    if len(display_df) > 5000:
+                        step = len(display_df) // 5000
+                        display_df = display_df.iloc[::step]
+                    
+                    # Add candlestick chart
+                    fig.add_trace(
+                        go.Candlestick(
+                            x=display_df.index,
                             open=display_df['open'],
                             high=display_df['high'],
                             low=display_df['low'],
@@ -951,150 +1033,320 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                             name='Price',
                             increasing_line_color='#26a69a',
                             decreasing_line_color='#ef5350'
-                        ))
+                        ),
+                        row=1, col=1
+                    )
+                    
+                    # Add SMAs if present
+                    if 'sma_fast' in indicators and 'sma_slow' in indicators:
+                        sma_fast = indicators['sma_fast']
+                        sma_slow = indicators['sma_slow']
                         
-                        # Add trade markers on price chart using Scattergl for WebGL performance
-                        if len(trades_df) > 0:
-                            # Collect all entry points
-                            entry_times = trades_df['open_time'].tolist()
-                            entry_prices = trades_df['open_price'].tolist()
-                            
-                            # Collect all exit points with colors
-                            exit_times = trades_df['close_time'].tolist()
-                            exit_prices = trades_df['close_price'].tolist()
-                            exit_colors = ['red' if profit < 0 else 'blue' for profit in trades_df['profit'].tolist()]
-                            
-                            # Add entry markers as single Scattergl trace
-                            fig_price.add_trace(go.Scattergl(
+                        # Align with display_df
+                        if len(display_df) < len(sma_fast):
+                            sma_fast_display = sma_fast.loc[display_df.index]
+                            sma_slow_display = sma_slow.loc[display_df.index]
+                        else:
+                            sma_fast_display = sma_fast
+                            sma_slow_display = sma_slow
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=sma_fast_display.index,
+                                y=sma_fast_display.values,
+                                mode='lines',
+                                name='Fast SMA',
+                                line=dict(color='cyan', width=1)
+                            ),
+                            row=1, col=1
+                        )
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=sma_slow_display.index,
+                                y=sma_slow_display.values,
+                                mode='lines',
+                                name='Slow SMA',
+                                line=dict(color='orange', width=1)
+                            ),
+                            row=1, col=1
+                        )
+                    
+                    # Add RSI subplot if present
+                    current_row = 2
+                    if 'rsi' in indicators:
+                        rsi = indicators['rsi']
+                        
+                        # Align with display_df
+                        if len(display_df) < len(rsi):
+                            rsi_display = rsi.loc[display_df.index]
+                        else:
+                            rsi_display = rsi
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=rsi_display.index,
+                                y=rsi_display.values,
+                                mode='lines',
+                                name='RSI',
+                                line=dict(color='purple', width=2)
+                            ),
+                            row=current_row, col=1
+                        )
+                        
+                        # Add RSI levels
+                        fig.add_hline(y=70, line_dash="dash", line_color="red", row=current_row, col=1, opacity=0.5)
+                        fig.add_hline(y=30, line_dash="dash", line_color="green", row=current_row, col=1, opacity=0.5)
+                        fig.add_hline(y=50, line_dash="dot", line_color="gray", row=current_row, col=1, opacity=0.3)
+                        
+                        fig.update_yaxes(title_text="RSI", row=current_row, col=1, range=[0, 100])
+                        current_row += 1
+                    
+                    # Add MACD subplot if present
+                    if 'macd' in indicators:
+                        macd = indicators['macd']
+                        macd_signal = indicators['macd_signal']
+                        macd_hist = indicators['macd_hist']
+                        
+                        # Align with display_df
+                        if len(display_df) < len(macd):
+                            macd_display = macd.loc[display_df.index]
+                            signal_display = macd_signal.loc[display_df.index]
+                            hist_display = macd_hist.loc[display_df.index]
+                        else:
+                            macd_display = macd
+                            signal_display = macd_signal
+                            hist_display = macd_hist
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=macd_display.index,
+                                y=macd_display.values,
+                                mode='lines',
+                                name='MACD',
+                                line=dict(color='blue', width=1.5)
+                            ),
+                            row=current_row, col=1
+                        )
+                        
+                        fig.add_trace(
+                            go.Scatter(
+                                x=signal_display.index,
+                                y=signal_display.values,
+                                mode='lines',
+                                name='Signal',
+                                line=dict(color='orange', width=1.5)
+                            ),
+                            row=current_row, col=1
+                        )
+                        
+                        # Histogram as bar chart
+                        colors = ['green' if val > 0 else 'red' for val in hist_display.values]
+                        fig.add_trace(
+                            go.Bar(
+                                x=hist_display.index,
+                                y=hist_display.values,
+                                name='Histogram',
+                                marker_color=colors,
+                                opacity=0.5
+                            ),
+                            row=current_row, col=1
+                        )
+                        
+                        fig.update_yaxes(title_text="MACD", row=current_row, col=1)
+                    
+                    # Add trade entry/exit markers
+                    trades = portfolio.trades.records_readable
+                    if len(trades) > 0:
+                        # Entry points - vectorbt uses different column names
+                        entry_times = pd.to_datetime(trades['Entry Timestamp'])
+                        # Try different possible column names for entry price
+                        if 'Avg Entry Price' in trades.columns:
+                            entry_prices = trades['Avg Entry Price']
+                        elif 'Entry Price' in trades.columns:
+                            entry_prices = trades['Entry Price']
+                        else:
+                            # Fallback: use the first price-related column
+                            entry_prices = trades.iloc[:, 3]  # Usually the 4th column
+                        
+                        fig.add_trace(
+                            go.Scatter(
                                 x=entry_times,
                                 y=entry_prices,
                                 mode='markers',
                                 marker=dict(
                                     symbol='triangle-up',
-                                    size=12,
-                                    color='green',
-                                    line=dict(width=2, color='white')
+                                    size=10,
+                                    color='lime',
+                                    line=dict(width=1, color='white')
                                 ),
-                                name="Entry",
-                                showlegend=True,
-                                legendgroup="trades"
-                            ))
-                            
-                            # Add exit markers as single Scattergl trace with individual colors
-                            fig_price.add_trace(go.Scattergl(
+                                name='Entry',
+                                showlegend=True
+                            ),
+                            row=1, col=1
+                        )
+                        
+                        # Exit points
+                        exit_times = pd.to_datetime(trades['Exit Timestamp'])
+                        # Try different possible column names for exit price
+                        if 'Avg Exit Price' in trades.columns:
+                            exit_prices = trades['Avg Exit Price']
+                        elif 'Exit Price' in trades.columns:
+                            exit_prices = trades['Exit Price']
+                        else:
+                            # Fallback: use the price-related column
+                            exit_prices = trades.iloc[:, 4]  # Usually the 5th column
+                        
+                        exit_colors = ['red' if pnl < 0 else 'blue' for pnl in trades['PnL']]
+                        
+                        fig.add_trace(
+                            go.Scatter(
                                 x=exit_times,
                                 y=exit_prices,
                                 mode='markers',
                                 marker=dict(
                                     symbol='triangle-down',
-                                    size=12,
+                                    size=10,
                                     color=exit_colors,
-                                    line=dict(width=2, color='white')
+                                    line=dict(width=1, color='white')
                                 ),
-                                name="Exit",
-                                showlegend=True,
-                                legendgroup="trades"
-                            ))
-                        
-                        fig_price.update_layout(
-                            title="Price Chart with Trade Markers",
-                            xaxis_title="Time",
-                            yaxis_title="Price",
-                            height=500,
-                            template="plotly_dark",
-                            xaxis_rangeslider_visible=False,
-                            uirevision='price_chart',  # Prevents unnecessary redraws
-                            hovermode='x unified',  # More efficient hover
-                            dragmode='pan'  # Default to pan for better performance
+                                name='Exit',
+                                showlegend=True
+                            ),
+                            row=1, col=1
                         )
-                        # Optimize x-axis for performance
-                        fig_price.update_xaxes(
-                            rangeslider_visible=False,
-                            type='date'
-                        )
-                        
-                        st.plotly_chart(fig_price, use_container_width=True)
                     
-                    elif view_mode == "Table":
-                        # Prepare table data
-                        display_df = trades_df.copy()
-                        display_df['Entry Time'] = pd.to_datetime(display_df['open_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
-                        display_df['Exit Time'] = pd.to_datetime(display_df['close_time']).dt.strftime('%Y-%m-%d %H:%M:%S')
-                        display_df['Direction'] = display_df['direction'].str.capitalize()
-                        display_df['Entry Price'] = display_df['open_price'].round(2)
-                        display_df['Exit Price'] = display_df['close_price'].round(2)
-                        display_df['P&L'] = display_df['profit'].round(2)
-                        display_df['Exit Reason'] = display_df['exit_reason']
+                    # Update layout
+                    fig.update_layout(
+                        height=600 + (num_subplots - 1) * 200,
+                        template="plotly_dark",
+                        xaxis_rangeslider_visible=False,
+                        hovermode='x unified',
+                        showlegend=True
+                    )
+                    
+                    fig.update_xaxes(title_text="Time", row=num_subplots, col=1)
+                    fig.update_yaxes(title_text="Price", row=1, col=1)
+                    
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                elif view_mode == "Trades Table":
+                    # Get trades from portfolio
+                    trades = portfolio.trades.records_readable
+                    
+                    if len(trades) > 0:
+                        # Format trades for display
+                        display_trades = trades.copy()
+                        display_trades['Entry Time'] = pd.to_datetime(display_trades['Entry Timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                        display_trades['Exit Time'] = pd.to_datetime(display_trades['Exit Timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
+                        display_trades['Return %'] = display_trades['Return'] * 100
                         
-                        # Select columns to display
-                        table_cols = ['Entry Time', 'Exit Time', 'Direction', 'Entry Price', 'Exit Price', 'P&L', 'Exit Reason']
-                        display_df = display_df[table_cols]
+                        # Select columns - handle different vectorbt column names
+                        cols_to_show = ['Entry Time', 'Exit Time', 'Direction', 'Size']
                         
-                        st.dataframe(display_df, use_container_width=True, height=600)
+                        # Add entry price column (different names in different vectorbt versions)
+                        if 'Avg Entry Price' in display_trades.columns:
+                            display_trades['Entry Price'] = display_trades['Avg Entry Price']
+                        elif 'Entry Price' in display_trades.columns: # Fallback for older versions
+                            display_trades['Entry Price'] = display_trades['Entry Price']
+                        if 'Entry Price' in display_trades.columns: # Only add if it exists after checks
+                            cols_to_show.append('Entry Price')
                         
-                        # Show summary statistics below table
+                        # Add exit price column
+                        if 'Avg Exit Price' in display_trades.columns:
+                            display_trades['Exit Price'] = display_trades['Avg Exit Price']
+                        elif 'Exit Price' in display_trades.columns: # Fallback for older versions
+                            display_trades['Exit Price'] = display_trades['Exit Price']
+                        if 'Exit Price' in display_trades.columns: # Only add if it exists after checks
+                            cols_to_show.append('Exit Price')
+                        
+                        # Add PnL and other columns
+                        cols_to_show.extend(['PnL', 'Return %'])
+                        
+                        # Add Status if available
+                        if 'Status' in display_trades.columns:
+                            cols_to_show.append('Status')
+                        
+                        # Only select columns that exist
+                        cols_to_show = [col for col in cols_to_show if col in display_trades.columns]
+                        display_trades = display_trades[cols_to_show]
+                        
+                        st.dataframe(display_trades, use_container_width=True, height=600)
+                        
+                        # Summary stats
                         st.markdown("---")
-                        col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
-                        with col_sum1:
-                            st.metric("Total Trades", total_trades)
-                        with col_sum2:
-                            st.metric("Winning Trades", winning_trades)
-                        with col_sum3:
-                            st.metric("Losing Trades", total_trades - winning_trades)
-                        with col_sum4:
-                            avg_profit = trades_df['profit'].mean()
-                            st.metric("Average P&L", f"${avg_profit:,.2f}")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Avg Win", f"${display_trades[display_trades['PnL'] > 0]['PnL'].mean():.2f}")
+                        with col2:
+                            st.metric("Avg Loss", f"${display_trades[display_trades['PnL'] < 0]['PnL'].mean():.2f}")
+                        with col3:
+                            st.metric("Best Trade", f"${display_trades['PnL'].max():.2f}")
+                        with col4:
+                            st.metric("Worst Trade", f"${display_trades['PnL'].min():.2f}")
+                    else:
+                        st.warning("No trades executed")
+                
+                elif view_mode == "Analytics":
+                    st.subheader("Trade Analytics & Distribution")
                     
-                    elif view_mode == "Distribution":
-                        # Prepare distribution data
-                        dist_df = trades_df.copy()
-                        dist_df['open_time'] = pd.to_datetime(dist_df['open_time'])
-                        dist_df['is_win'] = dist_df['profit'] > 0
-                        dist_df['direction_label'] = dist_df['direction'].str.capitalize()
-                        dist_df['day_of_week'] = dist_df['open_time'].dt.day_name()
-                        dist_df['hour'] = dist_df['open_time'].dt.hour
+                    # Get trades from portfolio
+                    trades = portfolio.trades.records_readable
+                    
+                    if len(trades) > 0:
+                        # Prepare analytics data
+                        analytics_df = trades.copy()
+                        analytics_df['Entry Timestamp'] = pd.to_datetime(analytics_df['Entry Timestamp'])
+                        analytics_df['is_win'] = analytics_df['PnL'] > 0
+                        analytics_df['day_of_week'] = analytics_df['Entry Timestamp'].dt.day_name()
+                        analytics_df['hour'] = analytics_df['Entry Timestamp'].dt.hour
                         
                         # Create subplots
-                        fig_dist = make_subplots(
+                        from plotly.subplots import make_subplots
+                        import plotly.graph_objects as go
+                        
+                        fig_analytics = make_subplots(
                             rows=1, cols=3,
-                            subplot_titles=('By Buy/Sell', 'By Day of Week', 'By Trading Hour'),
+                            subplot_titles=('By Direction (Long/Short)', 'By Day of Week', 'By Trading Hour'),
                             specs=[[{"type": "bar"}, {"type": "bar"}, {"type": "bar"}]]
                         )
                         
-                        # 1. Distribution by Buy/Sell
-                        buy_sell_counts = dist_df.groupby(['direction_label', 'is_win']).size().reset_index(name='count')
+                        # 1. Distribution by Long/Short
+                        direction_counts = analytics_df.groupby(['Direction', 'is_win']).size().reset_index(name='count')
                         
                         directions = ['Long', 'Short']
-                        x_buysell = []
+                        x_direction = []
                         y_win = []
                         y_loss = []
                         
                         for direction in directions:
-                            win_count = buy_sell_counts[
-                                (buy_sell_counts['direction_label'] == direction) & 
-                                (buy_sell_counts['is_win'] == True)
+                            win_count = direction_counts[
+                                (direction_counts['Direction'] == direction) & 
+                                (direction_counts['is_win'] == True)
                             ]['count'].sum()
-                            loss_count = buy_sell_counts[
-                                (buy_sell_counts['direction_label'] == direction) & 
-                                (buy_sell_counts['is_win'] == False)
+                            loss_count = direction_counts[
+                                (direction_counts['Direction'] == direction) & 
+                                (direction_counts['is_win'] == False)
                             ]['count'].sum()
                             
-                            x_buysell.append(direction)
-                            y_win.append(win_count)
-                            y_loss.append(loss_count)
+                            if win_count > 0 or loss_count > 0:
+                                x_direction.append(direction)
+                                y_win.append(win_count)
+                                y_loss.append(loss_count)
                         
-                        fig_dist.add_trace(
-                            go.Bar(x=x_buysell, y=y_win, name='Win', marker_color='green', showlegend=True),
-                            row=1, col=1
-                        )
-                        fig_dist.add_trace(
-                            go.Bar(x=x_buysell, y=y_loss, name='Loss', marker_color='red', showlegend=True),
-                            row=1, col=1
-                        )
+                        if x_direction:
+                            fig_analytics.add_trace(
+                                go.Bar(x=x_direction, y=y_win, name='Win', marker_color='#26a69a', showlegend=True),
+                                row=1, col=1
+                            )
+                            fig_analytics.add_trace(
+                                go.Bar(x=x_direction, y=y_loss, name='Loss', marker_color='#ef5350', showlegend=True),
+                                row=1, col=1
+                            )
                         
                         # 2. Distribution by Day of Week
                         day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-                        day_counts = dist_df.groupby(['day_of_week', 'is_win']).size().reset_index(name='count')
+                        day_counts = analytics_df.groupby(['day_of_week', 'is_win']).size().reset_index(name='count')
                         
                         x_days = []
                         y_win_days = []
@@ -1109,22 +1361,22 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                             ]['count'].sum()
                             
                             if win_count > 0 or loss_count > 0:
-                                x_days.append(day[:3])
+                                x_days.append(day[:3])  # Use 3-letter abbreviation
                                 y_win_days.append(win_count)
                                 y_loss_days.append(loss_count)
                         
                         if x_days:
-                            fig_dist.add_trace(
-                                go.Bar(x=x_days, y=y_win_days, name='Win', marker_color='green', showlegend=False),
+                            fig_analytics.add_trace(
+                                go.Bar(x=x_days, y=y_win_days, name='Win', marker_color='#26a69a', showlegend=False),
                                 row=1, col=2
                             )
-                            fig_dist.add_trace(
-                                go.Bar(x=x_days, y=y_loss_days, name='Loss', marker_color='red', showlegend=False),
+                            fig_analytics.add_trace(
+                                go.Bar(x=x_days, y=y_loss_days, name='Loss', marker_color='#ef5350', showlegend=False),
                                 row=1, col=2
                             )
                         
                         # 3. Distribution by Trading Hour
-                        hour_counts = dist_df.groupby(['hour', 'is_win']).size().reset_index(name='count')
+                        hour_counts = analytics_df.groupby(['hour', 'is_win']).size().reset_index(name='count')
                         
                         x_hours = []
                         y_win_hours = []
@@ -1144,32 +1396,114 @@ elif st.session_state['current_tab'] == 'Strategy Tester':
                                 y_loss_hours.append(loss_count)
                         
                         if x_hours:
-                            fig_dist.add_trace(
-                                go.Bar(x=x_hours, y=y_win_hours, name='Win', marker_color='green', showlegend=False),
+                            fig_analytics.add_trace(
+                                go.Bar(x=x_hours, y=y_win_hours, name='Win', marker_color='#26a69a', showlegend=False),
                                 row=1, col=3
                             )
-                            fig_dist.add_trace(
-                                go.Bar(x=x_hours, y=y_loss_hours, name='Loss', marker_color='red', showlegend=False),
+                            fig_analytics.add_trace(
+                                go.Bar(x=x_hours, y=y_loss_hours, name='Loss', marker_color='#ef5350', showlegend=False),
                                 row=1, col=3
                             )
                         
-                        fig_dist.update_layout(
+                        # Update layout
+                        fig_analytics.update_layout(
                             height=500,
                             template="plotly_dark",
                             barmode='group',
-                            showlegend=True
+                            showlegend=True,
+                            legend=dict(
+                                orientation="h",
+                                yanchor="bottom",
+                                y=1.02,
+                                xanchor="right",
+                                x=1
+                            )
                         )
                         
-                        fig_dist.update_xaxes(title_text="", row=1, col=1)
-                        fig_dist.update_xaxes(title_text="Day", row=1, col=2)
-                        fig_dist.update_xaxes(title_text="Hour", row=1, col=3)
-                        fig_dist.update_yaxes(title_text="Number of Trades", row=1, col=1)
-                        fig_dist.update_yaxes(title_text="Number of Trades", row=1, col=2)
-                        fig_dist.update_yaxes(title_text="Number of Trades", row=1, col=3)
+                        fig_analytics.update_xaxes(title_text="Direction", row=1, col=1)
+                        fig_analytics.update_xaxes(title_text="Day", row=1, col=2)
+                        fig_analytics.update_xaxes(title_text="Hour", row=1, col=3)
+                        fig_analytics.update_yaxes(title_text="Number of Trades", row=1, col=1)
+                        fig_analytics.update_yaxes(title_text="Number of Trades", row=1, col=2)
+                        fig_analytics.update_yaxes(title_text="Number of Trades", row=1, col=3)
                         
-                        st.plotly_chart(fig_dist, use_container_width=True)
+                        st.plotly_chart(fig_analytics, use_container_width=True)
+                        
+                        # Add summary statistics for each category
+                        st.markdown("---")
+                        st.subheader("Detailed Breakdown")
+                        
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.write("**By Direction**")
+                            for direction in ['Long', 'Short']:
+                                dir_trades = analytics_df[analytics_df['Direction'] == direction]
+                                if len(dir_trades) > 0:
+                                    win_rate = (dir_trades['is_win'].sum() / len(dir_trades)) * 100
+                                    avg_pnl = dir_trades['PnL'].mean()
+                                    st.metric(
+                                        f"{direction}",
+                                        f"{len(dir_trades)} trades",
+                                        f"WR: {win_rate:.1f}% | Avg: ${avg_pnl:.2f}"
+                                    )
+                        
+                        with col2:
+                            st.write("**By Day (Best/Worst)**")
+                            day_stats = analytics_df.groupby('day_of_week').agg({
+                                'PnL': ['sum', 'count', 'mean'],
+                                'is_win': 'sum'
+                            }).round(2)
+                            day_stats.columns = ['Total PnL', 'Trades', 'Avg PnL', 'Wins']
+                            day_stats['Win Rate %'] = (day_stats['Wins'] / day_stats['Trades'] * 100).round(1)
+                            
+                            # Sort by total PnL to find best/worst
+                            day_stats_sorted = day_stats.sort_values('Total PnL', ascending=False)
+                            
+                            if len(day_stats_sorted) > 0:
+                                best_day = day_stats_sorted.index[0]
+                                best_pnl = day_stats_sorted.iloc[0]['Total PnL']
+                                st.metric(f"Best: {best_day[:3]}", f"${best_pnl:.2f}", f"{day_stats_sorted.iloc[0]['Trades']:.0f} trades")
+                                
+                                if len(day_stats_sorted) > 1:
+                                    worst_day = day_stats_sorted.index[-1]
+                                    worst_pnl = day_stats_sorted.iloc[-1]['Total PnL']
+                                    st.metric(f"Worst: {worst_day[:3]}", f"${worst_pnl:.2f}", f"{day_stats_sorted.iloc[-1]['Trades']:.0f} trades")
+                        
+                        with col3:
+                            st.write("**By Hour (Most Active)**")
+                            hour_stats = analytics_df.groupby('hour').agg({
+                                'PnL': ['sum', 'count', 'mean'],
+                                'is_win': 'sum'
+                            }).round(2)
+                            hour_stats.columns = ['Total PnL', 'Trades', 'Avg PnL', 'Wins']
+                            hour_stats['Win Rate %'] = (hour_stats['Wins'] / hour_stats['Trades'] * 100).round(1)
+                            
+                            # Sort by number of trades to find most active hours
+                            hour_stats_sorted = hour_stats.sort_values('Trades', ascending=False)
+                            
+                            for i in range(min(3, len(hour_stats_sorted))):
+                                hour = hour_stats_sorted.index[i]
+                                trades = hour_stats_sorted.iloc[i]['Trades']
+                                avg_pnl = hour_stats_sorted.iloc[i]['Avg PnL']
+                                wr = hour_stats_sorted.iloc[i]['Win Rate %']
+                                st.metric(
+                                    f"{hour:02d}:00",
+                                    f"{trades:.0f} trades",
+                                    f"WR: {wr:.1f}% | Avg: ${avg_pnl:.2f}"
+                                )
+                    else:
+                        st.warning("No trades to analyze")
                 
-                else:
-                    st.warning("No trades generated by the strategy")
+                elif view_mode == "Stats":
+                    st.subheader("Detailed Performance Statistics")
+                    
+                    # Display full stats
+                    stats_df = pd.DataFrame({
+                        'Metric': stats.index,
+                        'Value': stats.values
+                    })
+                    
+                    st.dataframe(stats_df, use_container_width=True, height=600)
             else:
                 st.info("Configure strategy and click 'Run Backtest' to see results")

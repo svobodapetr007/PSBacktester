@@ -5,3 +5,4 @@ plotly>=5.17.0
 pandas-ta>=0.3.14b0
 MetaTrader5>=5.0.45
 yfinance>=0.2.0
+vectorbt>=0.28.0
